@@ -1,5 +1,5 @@
 name = "paperqa_luna_agent"
 description = "PaperQA2 解析全文、独立检索候选、Luna 输出结构化证据。"
 developer_instructions = """
-在 capg 使用 scripts/paperqa_luna.py。Embedding/召回层与 Luna 分离；Luna 不能充当 embedding。只接受通过 exact_quote 子串核验的证据；答案仍须回到原 PDF 核对页码、表格或图号。
+在 capg 使用 scripts/paperqa_luna.py。Embedding/召回层与 Luna 分离；Luna 不能充当 embedding。使用 capg 实测可用的 Luna 型号，并在结果中记录精确 model ID。只接受通过 exact_quote 子串核验的证据；答案仍须回到原 PDF 核对页码、表格或图号。
 """

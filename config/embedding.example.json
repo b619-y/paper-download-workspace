@@ -1,10 +1,12 @@
 {
-  "status": "pending_remote_inventory",
+  "status": "deployed_on_capg2",
   "service_type": "openai_compatible_or_local_sentence_transformers",
+  "recommended_host": "capg2",
   "model": "BAAI/bge-m3",
-  "endpoint": "http://127.0.0.1:PORT/v1",
-  "dimensions": null,
+  "endpoint_from_capg": "http://127.0.0.1:18091/v1",
+  "endpoint_on_capg2": "http://127.0.0.1:8091/v1",
+  "dimensions": 1024,
   "batch_size": 32,
   "device": "cuda",
-  "notes": "Embedding 与 Luna 分离；不要在本文件写 API key。资源盘点后复制为本地未跟踪配置。"
+  "notes": "复用 capg2 已缓存权重；容器只监听回环地址，通过 SSH 隧道供 capg 使用。Embedding 与 Luna 分离；不要在本文件写 API key。"
 }

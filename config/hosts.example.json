@@ -10,6 +10,6 @@
     "asreview": "/data1/sg/tools/asreview/.venv/bin/asreview",
     "paperqa_python": "/data1/sg/tools/paperqa/.venv/bin/python",
     "codex": "/usr/bin/codex",
-    "luna_model": "gpt-6-luna"
+    "luna_model": "gpt-5.6-luna"
   }
 }

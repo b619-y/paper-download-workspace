@@ -21,7 +21,7 @@
 - `criteria_screening_agent`：按明确纳入/排除标准进行可解释复核，适合寻找优化方法；不得替代人工最终决定。
 - `download_agent`：只下载有权访问的全文并核验身份、页数、哈希与来源。
 - `fulltext_screening_agent`：依据全文、表格和图片证据判断是否含目标数据或方法。
-- `paperqa_luna_agent`：PaperQA2 解析全文，独立 embedding/检索层提供候选，Codex CLI `gpt-6-luna` 输出结构化证据判断。
+- `paperqa_luna_agent`：PaperQA2 解析全文，独立 embedding/检索层提供候选，Codex CLI 中实测可用的 Luna 型号输出结构化证据判断。
 - `sync_agent`：Git 同步代码；运行数据严格按方向同步并检查冲突。
 
 各智能体只写其负责的批次或结果目录；总控区由协调者维护。
