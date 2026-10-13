@@ -169,6 +169,7 @@ def newest_run(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
         key=lambda run: (
             timestamp(run),
             run["path"].stat().st_mtime_ns,
+            str(run["path"]),
         ),
     )
 
