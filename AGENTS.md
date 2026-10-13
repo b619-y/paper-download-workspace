@@ -2,6 +2,20 @@
 
 本仓库组织一条可审计的论文流水线：检索式设计 → 多数据库全量导出 → 跨库去重 → 题名/摘要初筛 → 全文下载 → 全文证据筛选与数据提取。
 
+## 强制入口流程
+
+任何 Agent 每次进入本工作区，都必须先读 `01_shared/contracts/WORKFLOW_STATE_SCHEMA.md` 并执行：
+
+```bash
+python3 scripts/workflow_status.py --root . --json
+```
+
+按照报告顺序判断：任务简报 → 检索式 → API 检索/去重 → 题名摘要初筛 → 下载交接 → 全文下载/验收 → 全文证据筛选。先报告 `stage/reason/evidence/next_action`，再只执行 `next_action` 对应的最小安全步骤。不得靠聊天记忆猜进度，不得跳步，不得重做已有完整产物的阶段。每步完成后再运行一次状态检查。
+
+如果同时存在多个任务或多个可执行批次，先通过 `runtime/ACTIVE_TASK.json` 或显式的 `--task-id` / `--batch-id` 确定唯一对象；无法从用户指令与状态文件唯一确定时，停止写入并请用户选择。
+
+Mac 是 `runtime/ACTIVE_TASK.json` 和 `runtime/tasks/` 的协调权威端。capg Agent 开始前应由 Mac 运行 `scripts/sync_runtime.sh push-workflow --apply`；capg 只把计算结果写入 `runtime/results/`，由 Mac 验收后合并进任务状态。
+
 ## 总原则
 
 - 先读 `README_总控.md`、`00_control/POLICIES.md` 和相关合同。
@@ -14,6 +28,7 @@
 
 ## 智能体入口
 
+- `workflow_coordinator_agent`：先读取真实文件状态，判断断点并只调度下一阶段。
 - `query_agent`：拆解问题，生成 recall / balanced / precision_pilot 检索式。
 - `search_agent`：调用 OpenAlex、Crossref、Europe PMC、PubMed、Semantic Scholar、CORE、arXiv、WoS、Scopus，穷尽分页并保存原始响应。
 - `dedup_agent`：按 DOI 优先、规范化题名+年份次之去重，冲突不自动吞并。

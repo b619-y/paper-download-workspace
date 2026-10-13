@@ -1,0 +1,23 @@
+{
+  "task_id": "training-data-YYYYMMDD",
+  "title": "寻找可用的训练数据",
+  "research_question": "哪些论文可能提供目标训练数据？",
+  "inclusion_criteria": [
+    "<必填>"
+  ],
+  "exclusion_criteria": [
+    "<必填>"
+  ],
+  "target_evidence": [
+    "<必填：全文中要找的字段、方法或数据>"
+  ],
+  "requires_fulltext_screening": true,
+  "target_sources": [
+    "openalex",
+    "crossref",
+    "europe_pmc"
+  ],
+  "known_records": [],
+  "limits": {},
+  "created_at": "<ISO-8601>"
+}

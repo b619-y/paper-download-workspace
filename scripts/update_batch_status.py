@@ -19,7 +19,7 @@ WORKER_TRANSITIONS = {
     "BLOCKED": {"RUNNING", "FAILED"},
 }
 COORDINATOR_TRANSITIONS = {
-    "REVIEW": {"ACCEPTED", "RUNNING", "FAILED"},
+    "REVIEW": {"RUNNING", "FAILED"},
     "BLOCKED": {"READY", "FAILED"},
     "FAILED": {"READY"},
 }
@@ -38,6 +38,11 @@ def main() -> int:
     parser.add_argument("--worker", default="")
     parser.add_argument("--note", default="")
     args = parser.parse_args()
+    if args.status == "ACCEPTED":
+        parser.error(
+            "REVIEW -> ACCEPTED is reserved for accept_batch.py, which validates and "
+            "commits the delivery, indexes, backlog, acceptance record, and both status copies"
+        )
     root = Path(args.root).expanduser().resolve()
     batch = root / "02_batches" / args.batch_id
     status_path = batch / "STATUS.json"
