@@ -31,9 +31,11 @@
 - ASReview：`/data1/sg/tools/asreview/.venv/bin/asreview`
 - PaperQA2：`/data1/sg/tools/paperqa/.venv/bin/pqa`
 - PaperQA Python：`/data1/sg/tools/paperqa/.venv/bin/python`
-- Codex Luna：`/usr/bin/codex exec --model gpt-6-luna ...`
+- Codex Luna：`/usr/bin/codex exec --model <可用的 Luna 型号> ...`；capg 会话需以实测支持结果为准。
 
-ASReview 服务只监听 capg 回环地址，本地通过 SSH 隧道访问。PaperQA2 与 Luna 已拆开：embedding 是独立服务，未配置时 `paperqa_luna.py` 只用本地 BM25 作为可审计的临时召回层。
+ASReview 服务只监听 capg 回环地址，本地通过 SSH 隧道访问。PaperQA2 与 Luna 已拆开：BGE-M3 embedding 已部署到 capg2，capg 通过 `127.0.0.1:18091` 隧道访问；故障时 `paperqa_luna.py` 可记录原因并退回 BM25。Embedding 主机盘点见 `docs/Embedding主机盘点_2026-10-13.md`。
+
+当前部署与端到端验收结果见 `docs/部署验收_2026-10-13.md`。
 
 ## 领取规则
 

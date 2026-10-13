@@ -10,9 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import tempfile
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -88,6 +90,44 @@ def bm25(query: str, records: list[dict[str, object]], top_k: int) -> list[dict[
     selected = sorted(scores, reverse=True)[:top_k]
     output = []
     for score, index in selected:
+        item = dict(records[index])
+        item["retrieval_score"] = round(score, 6)
+        output.append(item)
+    return output
+
+
+def embedding_vectors(texts: list[str], base_url: str, model: str) -> list[list[float]]:
+    url = base_url.rstrip("/") + "/embeddings"
+    payload = json.dumps({"model": model, "input": texts}, ensure_ascii=False).encode()
+    request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        data = json.load(response)
+    ordered = sorted(data["data"], key=lambda item: item["index"])
+    return [item["embedding"] for item in ordered]
+
+
+def cosine(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    return dot / max(left_norm * right_norm, 1e-12)
+
+
+def embedding_retrieve(
+    query: str,
+    records: list[dict[str, object]],
+    top_k: int,
+    base_url: str,
+    model: str,
+) -> list[dict[str, object]]:
+    query_vector = embedding_vectors([query], base_url, model)[0]
+    scores: list[tuple[float, int]] = []
+    for start in range(0, len(records), 64):
+        batch = records[start : start + 64]
+        vectors = embedding_vectors([str(item["text"]) for item in batch], base_url, model)
+        scores.extend((cosine(query_vector, vector), start + offset) for offset, vector in enumerate(vectors))
+    output = []
+    for score, index in sorted(scores, reverse=True)[:top_k]:
         item = dict(records[index])
         item["retrieval_score"] = round(score, 6)
         output.append(item)
@@ -176,17 +216,43 @@ def main() -> int:
     parser.add_argument("--question", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--top-k", type=int, default=12)
-    parser.add_argument("--model", default="gpt-6-luna")
+    parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--codex", default="/usr/bin/codex")
+    parser.add_argument("--retriever", choices=["auto", "embedding", "bm25"], default="auto")
+    parser.add_argument(
+        "--embedding-base-url",
+        default=os.environ.get("PAPER_EMBEDDING_BASE_URL", "http://127.0.0.1:18091/v1"),
+    )
+    parser.add_argument("--embedding-model", default="BAAI/bge-m3")
     parser.add_argument("--retrieval-only", action="store_true")
     args = parser.parse_args()
 
     records = load_chunks(args.pdf_dir)
-    candidates = bm25(args.question, records, args.top_k)
+    retrieval_error = None
+    if args.retriever in {"auto", "embedding"}:
+        try:
+            candidates = embedding_retrieve(
+                args.question,
+                records,
+                args.top_k,
+                args.embedding_base_url,
+                args.embedding_model,
+            )
+            retriever = f"embedding:{args.embedding_model}"
+        except Exception as exc:
+            if args.retriever == "embedding":
+                raise
+            retrieval_error = f"{type(exc).__name__}: {exc}"
+            candidates = bm25(args.question, records, args.top_k)
+            retriever = "local-bm25-fallback"
+    else:
+        candidates = bm25(args.question, records, args.top_k)
+        retriever = "local-bm25"
     payload: dict[str, object] = {
         "parser": "paperqa-pypdf",
-        "retriever": "local-bm25-fallback",
-        "embedding_status": "separate_not_used",
+        "retriever": retriever,
+        "embedding_base_url": args.embedding_base_url if retriever.startswith("embedding:") else None,
+        "embedding_error": retrieval_error,
         "model": None if args.retrieval_only else args.model,
         "question": args.question,
         "candidate_count": len(candidates),
