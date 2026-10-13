@@ -1,0 +1,30 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+
+# 论文全文、授权会话和计算状态不进入 GitHub
+runtime/**
+!runtime/.gitkeep
+02_batches/**/outputs/files/**
+02_batches/**/inputs/search_screening/raw/**
+*.pdf
+*.xml
+*.caj
+*.zip
+*.doc
+*.docx
+*.xls
+*.xlsx
+
+# 本机/远端工具状态
+.asreview/
+.paperqa/
+asreview-data/
+paperqa-state/
+*.sqlite
+*.db
+*.asreview

@@ -1,0 +1,15 @@
+{
+  "mac": {
+    "workspace": "/Users/b/Desktop/智能体/论文下载工作区",
+    "runtime": "/Users/b/Desktop/智能体/论文下载工作区/runtime"
+  },
+  "capg": {
+    "ssh_alias": "capg",
+    "workspace": "/data1/sg/paper-workspace",
+    "runtime": "/data1/sg/paper-workspace/runtime",
+    "asreview": "/data1/sg/tools/asreview/.venv/bin/asreview",
+    "paperqa_python": "/data1/sg/tools/paperqa/.venv/bin/python",
+    "codex": "/usr/bin/codex",
+    "luna_model": "gpt-6-luna"
+  }
+}

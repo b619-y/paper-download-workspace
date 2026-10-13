@@ -1,0 +1,24 @@
+{
+  "query_id": "example-search",
+  "original_query": "soil AND (lead OR cadmium)",
+  "source_order": [
+    "openalex",
+    "crossref",
+    "europe_pmc",
+    "pubmed"
+  ],
+  "sources": {
+    "openalex": {
+      "query": "soil lead cadmium"
+    },
+    "crossref": {
+      "query": "soil lead cadmium"
+    },
+    "europe_pmc": {
+      "query": "soil AND (lead OR cadmium)"
+    },
+    "pubmed": {
+      "query": "soil AND (lead OR cadmium)"
+    }
+  }
+}

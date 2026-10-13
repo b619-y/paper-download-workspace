@@ -1,0 +1,10 @@
+{
+  "status": "pending_remote_inventory",
+  "service_type": "openai_compatible_or_local_sentence_transformers",
+  "model": "BAAI/bge-m3",
+  "endpoint": "http://127.0.0.1:PORT/v1",
+  "dimensions": null,
+  "batch_size": 32,
+  "device": "cuda",
+  "notes": "Embedding 与 Luna 分离；不要在本文件写 API key。资源盘点后复制为本地未跟踪配置。"
+}
