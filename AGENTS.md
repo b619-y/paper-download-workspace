@@ -45,7 +45,7 @@ LangGraph 只是一层可恢复的编排控制面，不替代上述强制入口�
 
 ## 总原则
 
-- 先读 `README_总控.md`、`00_control/POLICIES.md` 和相关合同。
+- 先读 `README.md` 的连续流程与目录图，再读 `README_总控.md`、`00_control/POLICIES.md` 和相关合同。
 - API 密钥、Cookie、机构登录态、PDF/XML/补充材料、ASReview 项目库、PaperQA 索引均不得提交 Git。
 - GitHub 只同步代码、提示词、合同和无敏感信息的配置模板。
 - 协调端负责检索、授权下载和验收；计算端负责 ASReview、PaperQA-style 证据适配、Codex Luna 与检索计算。

@@ -13,13 +13,13 @@ runtime/**
 !runtime/.gitkeep
 
 # 批次、审核、归档和动态索引是运行数据。公开仓库只保留
-# 01_shared/ 下的 schema/example，真实数据由初始化脚本在本机生成。
+# 合同、空示例和各编号目录的 README，真实数据由初始化脚本在本机生成。
 /02_batches/**
-!/02_batches/.gitkeep
+!/02_batches/README.md
 /03_review/**
-!/03_review/.gitkeep
+!/03_review/README.md
 /05_archive/**
-!/05_archive/.gitkeep
+!/05_archive/README.md
 /00_control/BATCH_INDEX.csv
 /00_control/DECISIONS.md
 /00_control/.queue.lock
@@ -32,9 +32,9 @@ runtime/**
 # 规则故意限定在真实运行根目录，不全局忽略 full.md、images/、
 # state/result/archive，以免误伤 tests/fixtures 或文档中的示例。
 /06_mineru/**
-!/06_mineru/.gitkeep
+!/06_mineru/README.md
 /07_xml_markdown/**
-!/07_xml_markdown/.gitkeep
+!/07_xml_markdown/README.md
 /02_batches/*/outputs/document_processing/**
 /02_batches/*/outputs/data_extraction/**
 /runtime/inputs/*/documents/**

@@ -45,6 +45,23 @@ def test_fresh_public_clone_reconciles_missing_runtime_skeleton(tmp_path: Path) 
     assert decisions.read_text(encoding="utf-8") == "# Decisions\n\nkeep me\n"
 
 
+def test_empty_workspace_gets_standard_readmes_and_continuous_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "empty-workspace"
+
+    run_init(root)
+
+    assert (root / "README.md").is_file()
+    assert (root / "README_总控.md").is_file()
+    for number, name in enumerate([
+        "00_control", "01_shared", "02_batches", "03_review",
+        "04_library_index", "05_archive", "06_mineru", "07_xml_markdown",
+    ]):
+        assert name.startswith(f"{number:02d}_")
+        assert (root / name).is_dir()
+
+
 def test_reconcile_appends_known_paper_index_columns_without_losing_rows(
     tmp_path: Path,
 ) -> None:

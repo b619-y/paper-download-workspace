@@ -36,6 +36,31 @@ DECISIONS_TEMPLATE = (
     "# Decisions\n\n"
     "记录批次重分配、验收、合并、撤销和异常处理决定。\n"
 )
+ROOT_README_TEMPLATE = """# 论文检索、下载与证据提取工作区
+
+连续流程：`0 任务定义 → 1 检索式 → 2 API 检索与去重 → 3 题名/摘要初筛 → 4 全文下载与验收 → 5 文档解析与验收 → 6 全文证据复筛 → 7 可选数据提取与交付`。
+
+先运行 `python3 scripts/workflow_status.py --root . --json`，只执行报告的 `next_action`。完整规则见 `README_总控.md`。
+"""
+CONTROL_README_TEMPLATE = """# 论文工作区总控操作手册
+
+工作区集中保存论文下载目的、下载清单、批次状态和下载结果。入队 Agent 只创建批次；下载 Agent 只写自己领取的批次目录；协调 Agent 负责验收和论文库索引。
+
+## 目录
+
+- `00_control/`：批次索引、政策和决定日志。
+- `01_shared/`：稳定合同、提示词和空示例。
+- `02_batches/<batch_id>/`：每次下载请求的独立子工作区。
+- `03_review/`：人工待办与验收记录。
+- `04_library_index/`：已验收论文文件索引。
+- `05_archive/`：已结束运行的本地归档。
+- `06_mineru/`：按原文 SHA-256 寻址的 MinerU 派生物。
+- `07_xml_markdown/`：按原文 SHA-256 寻址的 XML→Markdown 派生物。
+
+## 领取规则
+
+下载 Agent 必须使用 Skill 提供的原子领取脚本。一个批次只允许一个 Agent 领取。完成后状态写 `REVIEW`，只有协调 Agent 可以写 `ACCEPTED`。
+"""
 
 
 def utc_now() -> str:
@@ -139,19 +164,9 @@ def main() -> int:
         print(root)
         return 0
 
+    (root / "README.md").write_text(ROOT_README_TEMPLATE, encoding="utf-8")
     (root / "README_总控.md").write_text(
-        "# 论文下载工作区\n\n"
-        "这个工作区集中保存论文下载目的、下载清单、批次状态和下载结果。"
-        "入队Agent只创建批次；下载Agent只写自己领取的批次目录；协调Agent负责验收和论文库索引。\n\n"
-        "## 目录\n\n"
-        "- `00_control/BATCH_INDEX.csv`：全部批次索引。\n"
-        "- `02_batches/<batch_id>/`：每次下载请求的独立子工作区。\n"
-        "- `03_review/`：验收记录。\n"
-        "- `04_library_index/PAPER_INDEX.csv`：已验收论文文件索引。\n\n"
-        "## 领取规则\n\n"
-        "下载Agent必须使用Skill提供的原子领取脚本。一个批次只允许一个Agent领取。"
-        "完成后状态写`REVIEW`，只有协调Agent可以写`ACCEPTED`。\n",
-        encoding="utf-8",
+        CONTROL_README_TEMPLATE, encoding="utf-8",
     )
     (root / "00_control/POLICIES.md").write_text(
         "# 下载政策\n\n"

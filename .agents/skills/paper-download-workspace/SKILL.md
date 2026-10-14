@@ -93,13 +93,17 @@ python3 scripts/workflow_recovery.py status --root . --task-id <task_id>
 
 当用户要求“根据全文筛选”“判断是否包含想要的数据/内容”或下载批次完成后继续筛选时，当前智能体充当**任务筛选Agent**：先执行 `scripts/workflow_status.py --root . --json`。只有任务启用 `requires_document_processing` 或 `requires_data_extraction` 且报告要求解析时，才先完成文档队列、MinerU/XML 解析、`section_chunks.jsonl` 生成及协调验收；未启用处理开关的旧任务按状态机直接人工全文复筛。只有报告进入 `STAGE_3_CREATE_FULLTEXT_QUEUE` 时，才用 `scripts/make_fulltext_screening_queue.py <batch_id>` 生成全文筛选队列，再按协议逐项填写判断和证据。**若目标数据可能只在图中，必须先定位并下载目标图，阅读图像后才能完成该项判断；不得因 XML 或正文文本未列出数值就判为不存在。** 下载失败、只有摘要、身份未核验、全文不可读取或必需图像未取得时，标记全文/图像不可用或待人工处理；不得据此判为“不符合”。
 
-## 前端五阶段交接与下载后处理
+## 连续 0–7 流程
 
-### -1. 检索式Agent：研究问题到多数据库策略
+### 0. 任务定义：锁定研究问题与闸门
+
+创建任务简报前，明确研究目标、纳入/排除标准、目标数据或方法、时间/语言范围和已知相关论文；同时显式设定 `requires_fulltext_screening`、`requires_document_processing` 和 `requires_data_extraction`。信息不足时不启动 API 检索。
+
+### 1. 检索式Agent：研究问题到多数据库策略
 
 使用 `literature-query-agent` 把研究问题拆成 `search / screen / optional` 概念，生成 `recall / balanced / precision_pilot` 三套方案。通过种子论文召回、命中数和噪声抽样选择执行版；不得因为某套结果少就认定它更准确。保存 `query_brief.json`、`query_plan.json`、`query_matrix.csv`、`configs/` 和 `search_strategy.md`，再进入 API 检索。
 
-### 0. 论文检索Agent：API 检索与全量导出
+### 2. 论文检索Agent：API 检索与全量导出
 
 支持 OpenAlex、Crossref、Europe PMC、PubMed、Semantic Scholar、CORE、arXiv、Web of Science 和 Scopus。简单查询可直接运行：
 
@@ -114,7 +118,7 @@ python3 scripts/search_literature.py \
 
 检索完成后使用生成的 `pre_screening.csv`；各来源原始分页响应和 `run_manifest.json` 必须与它一同保存。“全部论文条目”只指各来源在其索引覆盖、原生检索式和访问权限下返回的全部匹配项，不等于全世界所有论文。
 
-### 1. 论文筛选Agent：下载前初筛
+### 3. 论文筛选Agent：下载前初筛
 
 - 输入至少包括检索式或候选记录，以及用户想找的数据/内容或纳入标准。
 - 保留原始检索式、数据库/来源、题名、摘要、DOI/URL和原始记录定位；不得凭记忆补造元数据。
@@ -132,11 +136,11 @@ python3 scripts/handoff_screening_to_download.py \
 
 脚本默认交接 `download + uncertain`，再次按 DOI、否则按规范化题名加年份去重，并拒绝空白决定、冲突决定或缺少筛选理由的记录。只交接明确 `download` 时加 `--download-only`。检索不完整时默认拒绝入队；只有用户已知情并接受缺口时才用 `--allow-incomplete-search`。
 
-### 2. 任务下载Agent：获取并核验全文
+### 4. 任务下载Agent：获取并核验全文
 
 只下载初筛交接的目标条目。下载完成并通过身份、格式和完整性闸门后，按原有流程提交 `download_results.csv`；网页、摘要、封面页和损坏文件不能进入全文筛选。
 
-### 2A. 文档解析Agent：MinerU/XML 解析与验收
+### 5. 文档解析Agent：MinerU/XML 解析与验收
 
 - 对已验收的下载批次运行 `scripts/make_document_processing_queue.py <batch_id> --root .`。
 - 用 `scripts/document_processing_worker.py` 领取作业：PDF 路由到 MinerU，XML 在本地转 Markdown。
@@ -145,7 +149,7 @@ python3 scripts/handoff_screening_to_download.py \
 - 协调 Agent 用 `scripts/accept_document_processing.py <batch_id> --root . --actor-role coordinator` 复算源、Markdown 和章节侧车哈希，校验版本与完整覆盖，再回填 `PAPER_INDEX.csv`。
 - 解析 Markdown 仅是派生文本；原 PDF/XML 仍是权威证据。详细 CLI、队列状态和哈希绑定见[下载后处理协议](references/post-download-processing.md)。
 
-### 3. 任务筛选Agent：全文证据复筛
+### 6. 任务筛选Agent：全文证据复筛
 
 - 先生成 `outputs/fulltext_screening_queue.csv`；脚本会区分 `ready`、`fulltext_unavailable` 和 `identity_unverified`。
 - 只对 `ready` 条目作内容判断。扫描件或无可靠文本层的 PDF 先 OCR；超长文档可分章节读取，但必须保留页码或章节定位。
@@ -155,7 +159,7 @@ python3 scripts/handoff_screening_to_download.py \
 - 另给每篇论文一个总体判断；关键纳入/排除决定和关键数据应由人工复核。LLM 的判断是辅助证据，不是不可复核的最终裁决。
 - 当前 `paperqa_luna.py` 是 PaperQA-style 适配器，不调用 PaperQA2 query/agent engine；直接 PDF 模式只可选使用 `paperqa-pypdf` 解析组件。未授权时只能 `--retrieval-only`，调用 Luna 的 judged mode 必须为本次运行显式加 `--external-model-authorized`。
 
-### 4. 数据提取Agent：可选的结构化提取与交付
+### 7. 数据提取Agent：可选的结构化提取与交付
 
 - 仅在用户需要结构化数据时创建 `extraction_spec.json`，明确字段、单位、行粒度、缺失/检出限语义和证据合同。
 - 用 `scripts/make_data_extraction_queue.py` 建队列；只有本次任务明确授权向模型发送解析全文时，才以 `--external-model-authorized` 运行 `scripts/luna_extract_data.py`。计算端只生成候选和不可变完成回执。
