@@ -5,12 +5,37 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
+WORKSPACE_DIRS = (
+    "00_control", "01_shared/contracts", "01_shared/prompts", "02_batches",
+    "03_review", "04_library_index", "05_archive", "06_mineru",
+    "07_xml_markdown", "runtime",
+)
+BATCH_FIELDS = [
+    "batch_id", "created_at", "title", "purpose", "status", "paper_count",
+    "download_count", "reference_existing_count", "verify_existing_count", "priority",
+    "source_list", "workspace_path", "claimed_by", "updated_at", "accepted_at",
+]
+PAPER_FIELDS = [
+    "paper_id", "title", "doi", "pdf_path", "supplement_paths", "sha256",
+    "source_batch_id", "identity_verified", "accepted_at", "notes",
+    "mineru_md_path", "xml_md_path", "source_item_id", "document_id",
+    "source_kind", "processed_text_sha256", "processing_method",
+    "processing_version", "processing_accepted_at", "section_chunks_path",
+    "section_chunks_sha256", "section_chunks_count", "section_chunks_schema_version",
+]
+DECISIONS_TEMPLATE = (
+    "# Decisions\n\n"
+    "记录批次重分配、验收、合并、撤销和异常处理决定。\n"
+)
 
 
 def utc_now() -> str:
@@ -18,8 +43,46 @@ def utc_now() -> str:
 
 
 def write_csv_header(path: Path, fields: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         csv.DictWriter(handle, fieldnames=fields).writeheader()
+
+
+def reconcile_csv(path: Path, fields: list[str]) -> None:
+    """Create a missing index or safely append newly introduced columns."""
+    if not path.exists():
+        write_csv_header(path, fields)
+        return
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"workspace index is not a regular file: {path}")
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        current = list(reader.fieldnames or [])
+        rows = list(reader)
+    if current == fields:
+        return
+    if not current or fields[:len(current)] != current:
+        raise ValueError(
+            f"workspace index header is incompatible: {path}; "
+            f"found {current!r}, expected prefix of {fields!r}"
+        )
+    if any(None in row for row in rows):
+        raise ValueError(f"workspace index contains columns outside its header: {path}")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main() -> int:
@@ -28,45 +91,53 @@ def main() -> int:
     args = parser.parse_args()
     root = Path(args.root).expanduser().resolve()
     identity = root / "00_control/WORKSPACE.json"
-    if identity.exists():
-        print(root)
-        return 0
-    if root.exists() and any(root.iterdir()):
+    existing_workspace = identity.exists()
+    if not existing_workspace and root.exists() and any(root.iterdir()):
         parser.error(f"non-empty directory is not a paper-download workspace: {root}")
 
-    for rel in [
-        "00_control",
-        "01_shared/contracts",
-        "01_shared/prompts",
-        "02_batches",
-        "03_review",
-        "04_library_index",
-        "05_archive",
-    ]:
+    for rel in WORKSPACE_DIRS:
         (root / rel).mkdir(parents=True, exist_ok=True)
 
     now = utc_now()
-    identity.write_text(json.dumps({
-        "workspace_id": "paper-download-workspace",
-        "title": "论文下载工作区",
-        "created_at": now,
-        "workspace_version": 1,
-        "coordinator": "local-coordinator",
-        "default_status": "READY",
-        "local_machine_only": True,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if existing_workspace:
+        if identity.is_symlink() or not identity.is_file():
+            parser.error(f"workspace identity is not a regular file: {identity}")
+        try:
+            workspace = json.loads(identity.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            parser.error(f"workspace identity is unreadable: {identity}: {exc}")
+        if not isinstance(workspace, dict) or workspace.get("workspace_id") != "paper-download-workspace":
+            parser.error(f"directory has an incompatible WORKSPACE.json: {root}")
+    else:
+        identity.write_text(json.dumps({
+            "workspace_id": "paper-download-workspace",
+            "title": "论文下载工作区",
+            "created_at": now,
+            "workspace_version": 1,
+            "coordinator": "local-coordinator",
+            "default_status": "READY",
+            "local_machine_only": True,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    batch_fields = [
-        "batch_id", "created_at", "title", "purpose", "status", "paper_count",
-        "download_count", "reference_existing_count", "verify_existing_count", "priority",
-        "source_list", "workspace_path", "claimed_by", "updated_at", "accepted_at",
-    ]
-    write_csv_header(root / "00_control/BATCH_INDEX.csv", batch_fields)
-    write_csv_header(root / "04_library_index/PAPER_INDEX.csv", [
-        "paper_id", "title", "doi", "pdf_path", "supplement_paths", "sha256",
-        "source_batch_id", "identity_verified", "accepted_at", "notes",
-        "mineru_md_path", "xml_md_path",
-    ])
+    lock_path = root / "00_control/.queue.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            reconcile_csv(root / "00_control/BATCH_INDEX.csv", BATCH_FIELDS)
+            reconcile_csv(root / "04_library_index/PAPER_INDEX.csv", PAPER_FIELDS)
+            decisions = root / "00_control/DECISIONS.md"
+            if not decisions.exists():
+                decisions.write_text(DECISIONS_TEMPLATE, encoding="utf-8")
+            elif decisions.is_symlink() or not decisions.is_file():
+                parser.error(f"workspace decisions path is not a regular file: {decisions}")
+        except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+            parser.error(str(exc))
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    if existing_workspace:
+        print(root)
+        return 0
 
     (root / "README_总控.md").write_text(
         "# 论文下载工作区\n\n"
@@ -89,10 +160,6 @@ def main() -> int:
         "- 网页、摘要、封面页和损坏文件不能冒充完整PDF。\n"
         "- 每篇成功文件必须核验身份并记录来源、哈希、大小和页数。\n"
         "- 工作区不得保存账号、Cookie、API密钥或`.env`。\n",
-        encoding="utf-8",
-    )
-    (root / "00_control/DECISIONS.md").write_text(
-        "# Decisions\n\n记录批次重分配、验收、合并、撤销和异常处理决定。\n",
         encoding="utf-8",
     )
     (root / "01_shared/contracts/MANIFEST_SCHEMA.md").write_text(

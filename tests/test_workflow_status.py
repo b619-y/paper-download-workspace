@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.workflow_status import FULLTEXT_FIELDS, inspect
+from scripts import paper_section_chunking, processing_queue
+from scripts.workflow_status import DOCUMENT_PROCESSING_FIELDS, FULLTEXT_FIELDS, inspect
 
 
 INDEX_FIELDS = ["batch_id", "status", "claimed_by"]
-RESULT_FIELDS = ["item_id", "paper_id", "status", "title", "doi", "pdf_path", "identity_verified"]
+RESULT_FIELDS = [
+    "item_id", "paper_id", "status", "title", "doi", "pdf_path", "sha256",
+    "identity_verified",
+]
 PAPER_INDEX_FIELDS = [
     "paper_id", "title", "doi", "pdf_path", "supplement_paths", "sha256",
     "source_batch_id", "identity_verified", "accepted_at", "notes",
-    "mineru_md_path", "xml_md_path",
+    "mineru_md_path", "xml_md_path", "source_item_id", "document_id",
+    "source_kind", "processed_text_sha256", "processing_method",
+    "processing_version", "processing_accepted_at", "section_chunks_path",
+    "section_chunks_sha256", "section_chunks_count", "section_chunks_schema_version",
 ]
 SCREEN_FIELDS = [
     "record_id", "search_query", "source_database", "source_record", "title",
@@ -36,6 +45,11 @@ def write_csv(path: Path, rows: list[dict[str, str]], fields: list[str]) -> None
         writer.writerows(rows)
 
 
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
 class WorkflowStatusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -48,9 +62,11 @@ class WorkflowStatusTests(unittest.TestCase):
         self.temp.cleanup()
 
     def task(self, task_id: str = "T1", *, fulltext: bool = True,
+             document_processing: bool | None = None,
+             data_extraction: bool | None = None,
              active: bool = True, batch_ids: list[str] | None = None) -> Path:
         task = self.root / "runtime/tasks" / task_id
-        write_json(task / "task_brief.json", {
+        brief = {
             "task_id": task_id,
             "title": "Test task",
             "research_question": "Which papers match?",
@@ -58,7 +74,12 @@ class WorkflowStatusTests(unittest.TestCase):
             "exclusion_criteria": ["irrelevant"],
             "target_evidence": ["target data"],
             "requires_fulltext_screening": fulltext,
-        })
+        }
+        if document_processing is not None:
+            brief["requires_document_processing"] = document_processing
+        if data_extraction is not None:
+            brief["requires_data_extraction"] = data_extraction
+        write_json(task / "task_brief.json", brief)
         if active:
             write_json(self.root / "runtime/ACTIVE_TASK.json", {
                 "task_id": task_id,
@@ -139,10 +160,11 @@ class WorkflowStatusTests(unittest.TestCase):
             fulltext = batch / "outputs/files/P1.pdf"
             fulltext.parent.mkdir(parents=True, exist_ok=True)
             fulltext.write_bytes(b"%PDF-test")
+            fulltext_sha = hashlib.sha256(fulltext.read_bytes()).hexdigest()
             write_csv(batch / "outputs/download_results.csv", [{
                 "item_id": "D001", "paper_id": "P1", "status": "downloaded",
                 "title": "Paper", "doi": "10/test", "pdf_path": str(fulltext),
-                "identity_verified": "true",
+                "sha256": fulltext_sha, "identity_verified": "true",
             }], RESULT_FIELDS)
             acceptance = self.root / "03_review" / f"{batch_id}-acceptance.md"
             acceptance.parent.mkdir(parents=True, exist_ok=True)
@@ -153,7 +175,9 @@ class WorkflowStatusTests(unittest.TestCase):
             papers.append({
                 "paper_id": "P1", "title": "Paper", "doi": "10/test",
                 "pdf_path": str(fulltext), "source_batch_id": batch_id,
-                "identity_verified": "true",
+                "identity_verified": "true", "source_item_id": "D001",
+                "source_kind": "pdf",
+                "sha256": fulltext_sha,
             })
             write_csv(paper_index, papers, PAPER_INDEX_FIELDS)
         return batch
@@ -167,6 +191,128 @@ class WorkflowStatusTests(unittest.TestCase):
         })
         row.update(overrides)
         return row
+
+    def document_queue(self, batch_id: str = "DL-1", *, status: str = "accepted") -> dict:
+        batch = self.root / "02_batches" / batch_id
+        result = read_csv_rows(batch / "outputs/download_results.csv")[0]
+        source = Path(result["pdf_path"])
+        source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        kind = "xml" if source.suffix == ".xml" else "pdf"
+        processor = "xml_to_markdown" if kind == "xml" else "mineru"
+        version = "xml-local-v1" if kind == "xml" else "mineru-api-v4-queue-v1"
+        document_id = "doi-test"
+        job_id = f"dp-{batch_id}"
+        output = processing_queue.artifact_output_dir(
+            self.root, kind, source_sha, job_id)
+        parsed = output / "full.md"
+        state = output / "state.json"
+        result_path = output / "result.json"
+        sections = output / "section_chunks.jsonl"
+        parsed_sha = sections_sha = state_sha = result_sha = ""
+        sections_count = 0
+        if status in {"review", "accepted"}:
+            output.mkdir(parents=True, exist_ok=True)
+            parsed.write_text("# Parsed paper\n\nA sufficiently non-empty parsed document.\n", encoding="utf-8")
+            parsed_sha = hashlib.sha256(parsed.read_bytes()).hexdigest()
+            sections_sha, sections_count = paper_section_chunking.write_sections_jsonl(
+                parsed,
+                sections,
+                paper_id="P1",
+                source_file=source.name,
+                source_format=kind,
+                source_sha256=source_sha,
+            )
+            state_doc = {
+                "status": "done", "job_id": job_id, "document_id": document_id,
+                "paper_id": "P1", "source_file": source.name, "source_format": kind,
+                "source_sha256": source_sha, "processor": processor,
+                "processor_version": version, "parsed_text_path": "full.md",
+                "parsed_text_sha256": parsed_sha,
+                "sections_path": "section_chunks.jsonl", "sections_sha256": sections_sha,
+                "sections_count": sections_count,
+            }
+            if processor == "mineru":
+                state_doc.update({
+                    "remote_batch_id": "remote-test",
+                    "remote_data_id": job_id,
+                })
+            write_json(state, state_doc)
+            state_sha = hashlib.sha256(state.read_bytes()).hexdigest()
+            write_json(result_path, {
+                **state_doc, "status": "succeeded", "state_path": "state.json",
+                "state_sha256": state_sha,
+            })
+            result_sha = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        queue_path = batch / "outputs/document_processing/queue.sqlite3"
+        database = processing_queue.connect(queue_path)
+        try:
+            processing_queue.initialize(database)
+            processing_queue.insert_job(database, {
+                "job_id": job_id, "batch_id": batch_id, "source_item_id": "D001",
+                "paper_id": "P1", "document_id": document_id, "title": "Paper",
+                "doi": "10/test", "source_kind": kind,
+                "source_path": processing_queue.portable_path(self.root, source),
+                "source_sha256": source_sha, "processor": processor,
+                "processor_version": version,
+                "output_dir": processing_queue.portable_path(self.root, output),
+                "parsed_text_path": processing_queue.portable_path(self.root, parsed) if parsed_sha else "",
+                "parsed_text_sha256": parsed_sha,
+                "sections_path": processing_queue.portable_path(self.root, sections) if sections_sha else "",
+                "sections_sha256": sections_sha, "sections_count": sections_count,
+                "state_path": processing_queue.portable_path(self.root, state) if state_sha else "",
+                "state_sha256": state_sha,
+                "result_path": processing_queue.portable_path(self.root, result_path) if result_sha else "",
+                "result_sha256": result_sha, "status": status,
+                "accepted_at": "2026-10-14T00:00:00+00:00" if status == "accepted" else "",
+            })
+            processing_queue.export_projection(
+                database, processing_queue.projection_path(self.root, batch_id),
+            )
+        finally:
+            database.close()
+        if status == "accepted":
+            index_path = self.root / "04_library_index/PAPER_INDEX.csv"
+            rows = read_csv_rows(index_path)
+            row = next(item for item in rows if item["source_batch_id"] == batch_id)
+            row.update({
+                "source_item_id": "D001", "document_id": document_id,
+                "source_kind": kind, "processed_text_sha256": parsed_sha,
+                "processing_method": processor, "processing_version": version,
+                "processing_accepted_at": "2026-10-14T00:00:00+00:00",
+                "mineru_md_path": str(parsed) if kind == "pdf" else "",
+                "xml_md_path": str(parsed) if kind == "xml" else "",
+                "section_chunks_path": str(sections),
+                "section_chunks_sha256": sections_sha,
+                "section_chunks_count": str(sections_count),
+                "section_chunks_schema_version": paper_section_chunking.SECTION_SCHEMA_VERSION,
+            })
+            write_csv(index_path, rows, PAPER_INDEX_FIELDS)
+        return {
+            "job_id": job_id, "source": source, "source_sha256": source_sha,
+            "parsed": parsed, "parsed_sha256": parsed_sha, "kind": kind,
+            "processor": processor, "version": version,
+        }
+
+    def make_xml_source(self, batch_id: str = "DL-1") -> Path:
+        batch = self.root / "02_batches" / batch_id
+        xml = batch / "outputs/tdm-xml/P1.xml"
+        xml.parent.mkdir(parents=True, exist_ok=True)
+        xml.write_text("<article><body>full text</body></article>", encoding="utf-8")
+        write_csv(batch / "outputs/download_results.csv", [{
+            "item_id": "D001", "paper_id": "P1", "status": "downloaded",
+            "title": "Paper", "doi": "10/test", "pdf_path": str(xml),
+            "sha256": hashlib.sha256(xml.read_bytes()).hexdigest(),
+            "identity_verified": "true",
+        }], RESULT_FIELDS)
+        index_path = self.root / "04_library_index/PAPER_INDEX.csv"
+        rows = read_csv_rows(index_path)
+        row = next(item for item in rows if item["source_batch_id"] == batch_id)
+        row.update({
+            "pdf_path": str(xml), "sha256": hashlib.sha256(xml.read_bytes()).hexdigest(),
+            "source_kind": "xml", "source_item_id": "D001",
+        })
+        write_csv(index_path, rows, PAPER_INDEX_FIELDS)
+        return xml
 
     def test_empty_workspace_starts_with_task_brief(self) -> None:
         self.assertEqual(inspect(self.root)["stage"], "NOT_STARTED")
@@ -409,7 +555,7 @@ class WorkflowStatusTests(unittest.TestCase):
         self.assertEqual(inspect(self.root, task_id="T1", batch_id="DL-2")["stage"], "STAGE_2_DOWNLOAD")
 
     def test_batch_can_be_related_by_copied_handoff_query_id(self) -> None:
-        task = self.task(batch_ids=[])
+        task = self.task(fulltext=False, batch_ids=[])
         self.valid_query(task)
         rows = [{
             "record_id": "R1", "title": "Paper", "year": "2025", "doi": "10/x",
@@ -677,6 +823,125 @@ class WorkflowStatusTests(unittest.TestCase):
         self.batch("T1", "DL-1", "ACCEPTED")
         self.assertEqual(inspect(self.root)["stage"], "STAGE_3_CREATE_FULLTEXT_QUEUE")
 
+    def test_optional_processing_flags_are_backward_compatible_and_dependency_checked(self) -> None:
+        task = self.task(fulltext=False, batch_ids=[])
+        self.assertEqual(inspect(self.root)["stage"], "STAGE_MINUS_1_QUERY_DESIGN")
+        brief_path = task / "task_brief.json"
+        brief = json.loads(brief_path.read_text(encoding="utf-8"))
+        brief["requires_data_extraction"] = True
+        write_json(brief_path, brief)
+        status = inspect(self.root)
+        self.assertEqual(status["stage"], "STAGE_MINUS_1_TASK_BRIEF")
+        issues = " ".join(status["evidence"]["task_brief_issues"])
+        self.assertIn("requires_document_processing=true", issues)
+        self.assertIn("requires_fulltext_screening=true", issues)
+
+    def test_document_processing_stage_progression_and_pdf_acceptance(self) -> None:
+        self.task(document_processing=True, batch_ids=["DL-1"])
+        batch = self.batch("T1", "DL-1", "ACCEPTED")
+        self.assertEqual(inspect(self.root)["stage"], "STAGE_3_CREATE_DOCUMENT_PROCESSING_QUEUE")
+        self.document_queue(status="queued")
+        status = inspect(self.root)
+        self.assertEqual(status["stage"], "STAGE_3_DOCUMENT_PROCESSING")
+        self.assertIn("document_processing_worker.py", status["next_action"])
+        (batch / "outputs/document_processing/queue.sqlite3").unlink()
+        (batch / "outputs/document_processing/queue.csv").unlink()
+        self.document_queue(status="accepted")
+        self.assertEqual(inspect(self.root)["stage"], "STAGE_3_CREATE_FULLTEXT_QUEUE")
+
+    def test_document_processing_routes_retry_review_blocked_and_failed(self) -> None:
+        expected = {
+            "retry_wait": "STAGE_3_DOCUMENT_PROCESSING_RECOVERY",
+            "review": "STAGE_3_DOCUMENT_PROCESSING_REVIEW",
+            "blocked": "STAGE_3_DOCUMENT_PROCESSING_BLOCKED",
+            "failed": "STAGE_3_DOCUMENT_PROCESSING_FAILED",
+        }
+        for job_status, stage in expected.items():
+            with self.subTest(status=job_status):
+                with tempfile.TemporaryDirectory() as directory:
+                    previous = self.root
+                    self.root = Path(directory)
+                    try:
+                        write_json(self.root / "00_control/WORKSPACE.json", {"workspace_id": "test"})
+                        write_csv(self.root / "00_control/BATCH_INDEX.csv", [], INDEX_FIELDS)
+                        write_csv(self.root / "04_library_index/PAPER_INDEX.csv", [], PAPER_INDEX_FIELDS)
+                        self.task(document_processing=True, batch_ids=["DL-1"])
+                        self.batch("T1", "DL-1", "ACCEPTED")
+                        self.document_queue(status=job_status)
+                        self.assertEqual(inspect(self.root)["stage"], stage)
+                    finally:
+                        self.root = previous
+
+    def test_document_processing_accepts_xml_branch(self) -> None:
+        self.task(document_processing=True, batch_ids=["DL-1"])
+        self.batch("T1", "DL-1", "ACCEPTED")
+        self.make_xml_source()
+        job = self.document_queue(status="accepted")
+        self.assertEqual(job["kind"], "xml")
+        self.assertEqual(job["processor"], "xml_to_markdown")
+        self.assertEqual(inspect(self.root)["stage"], "STAGE_3_CREATE_FULLTEXT_QUEUE")
+
+    def test_document_processing_rejects_source_parsed_and_index_mismatches(self) -> None:
+        self.task(document_processing=True, batch_ids=["DL-1"])
+        self.batch("T1", "DL-1", "ACCEPTED")
+        job = self.document_queue(status="accepted")
+        index_path = self.root / "04_library_index/PAPER_INDEX.csv"
+        rows = read_csv_rows(index_path)
+        rows[0]["processed_text_sha256"] = "0" * 64
+        write_csv(index_path, rows, PAPER_INDEX_FIELDS)
+        status = inspect(self.root)
+        self.assertEqual(status["stage"], "STAGE_3_DOCUMENT_PROCESSING_INVALID")
+        self.assertIn("processed_text_sha256", " ".join(
+            status["evidence"]["batches"][0]["document_processing"]["issues"]
+        ))
+        rows[0]["processed_text_sha256"] = job["parsed_sha256"]
+        write_csv(index_path, rows, PAPER_INDEX_FIELDS)
+        job["parsed"].write_text("tampered", encoding="utf-8")
+        status = inspect(self.root)
+        self.assertEqual(status["stage"], "STAGE_3_DOCUMENT_PROCESSING_INVALID")
+        self.assertIn("parsed_text_sha256", " ".join(
+            status["evidence"]["batches"][0]["document_processing"]["issues"]
+        ))
+
+    def test_processing_index_anchors_sidecar_after_queue_rehash(self) -> None:
+        self.task(document_processing=True, batch_ids=["DL-1"])
+        self.batch("T1", "DL-1", "ACCEPTED")
+        job = self.document_queue(status="accepted")
+        output = job["parsed"].parent
+        sections = output / "section_chunks.jsonl"
+        sections.write_bytes(sections.read_bytes() + b"\n")
+        sections_sha = hashlib.sha256(sections.read_bytes()).hexdigest()
+        state_path = output / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["sections_sha256"] = sections_sha
+        write_json(state_path, state)
+        state_sha = hashlib.sha256(state_path.read_bytes()).hexdigest()
+        result_path = output / "result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["sections_sha256"] = sections_sha
+        result["state_sha256"] = state_sha
+        write_json(result_path, result)
+        database = processing_queue.connect(
+            processing_queue.database_path(self.root, "DL-1"))
+        try:
+            database.execute(
+                """UPDATE jobs SET sections_sha256=?,state_sha256=?,result_sha256=?
+                     WHERE job_id=?""",
+                (
+                    sections_sha, state_sha,
+                    hashlib.sha256(result_path.read_bytes()).hexdigest(), job["job_id"],
+                ),
+            )
+            processing_queue.export_projection(
+                database, processing_queue.projection_path(self.root, "DL-1"))
+        finally:
+            database.close()
+        status = inspect(self.root)
+        self.assertEqual(status["stage"], "STAGE_3_DOCUMENT_PROCESSING_INVALID")
+        self.assertIn("section_chunks_sha256", " ".join(
+            status["evidence"]["batches"][0]["document_processing"]["issues"]
+        ))
+
     def test_accepted_batch_requires_results_coverage_and_acceptance_record(self) -> None:
         self.task(fulltext=False, batch_ids=["DL-1"])
         batch = self.batch("T1", "DL-1", "ACCEPTED")
@@ -741,6 +1006,34 @@ class WorkflowStatusTests(unittest.TestCase):
             "is empty", " ".join(status["evidence"]["batches"][0]["acceptance"]["issues"]),
         )
 
+    def test_accepted_fulltext_must_keep_indexed_sha256(self) -> None:
+        self.task(fulltext=False, batch_ids=["DL-1"])
+        batch = self.batch("T1", "DL-1", "ACCEPTED")
+        (batch / "outputs/files/P1.pdf").write_bytes(b"%PDF-mutated-after-acceptance")
+
+        status = inspect(self.root)
+
+        self.assertEqual(status["stage"], "BATCH_STATE_ERROR")
+        self.assertIn(
+            "SHA-256 differs from PAPER_INDEX",
+            " ".join(status["evidence"]["batches"][0]["acceptance"]["issues"]),
+        )
+
+    def test_download_result_sha_must_match_index_and_actual_file(self) -> None:
+        self.task(fulltext=False, batch_ids=["DL-1"])
+        batch = self.batch("T1", "DL-1", "ACCEPTED")
+        rows = read_csv_rows(batch / "outputs/download_results.csv")
+        rows[0]["sha256"] = "0" * 64
+        write_csv(batch / "outputs/download_results.csv", rows, RESULT_FIELDS)
+
+        status = inspect(self.root)
+
+        self.assertEqual(status["stage"], "BATCH_STATE_ERROR")
+        self.assertIn(
+            "differs from download_results.csv",
+            " ".join(status["evidence"]["batches"][0]["acceptance"]["issues"]),
+        )
+
     def test_accepted_batch_allows_explicit_failure_record(self) -> None:
         self.task(fulltext=True, batch_ids=["DL-1"])
         batch = self.batch("T1", "DL-1", "ACCEPTED")
@@ -769,6 +1062,7 @@ class WorkflowStatusTests(unittest.TestCase):
         write_csv(batch / "outputs/download_results.csv", [{
             "item_id": "D001", "paper_id": "P1", "status": "downloaded",
             "title": "Paper", "doi": "10/test", "pdf_path": str(xml_path),
+            "sha256": hashlib.sha256(xml_path.read_bytes()).hexdigest(),
             "identity_verified": "true",
         }], RESULT_FIELDS)
         relative_xml = xml_path.relative_to(self.root)
@@ -776,6 +1070,7 @@ class WorkflowStatusTests(unittest.TestCase):
             "paper_id": "P1", "title": "Paper", "doi": "10/test",
             "pdf_path": str(relative_xml), "source_batch_id": "DL-1",
             "identity_verified": "true",
+            "sha256": hashlib.sha256(xml_path.read_bytes()).hexdigest(),
         }], PAPER_INDEX_FIELDS)
         self.assertEqual(inspect(self.root)["stage"], "STAGE_3_CREATE_FULLTEXT_QUEUE")
         write_csv(batch / "outputs/fulltext_screening_queue.csv", [self.queue_row(
@@ -790,12 +1085,14 @@ class WorkflowStatusTests(unittest.TestCase):
         write_csv(batch / "outputs/download_results.csv", [{
             "item_id": "D001", "paper_id": "P1", "status": "downloaded",
             "title": "Paper", "doi": "10/test", "pdf_path": str(relative_pdf),
+            "sha256": hashlib.sha256((self.root / relative_pdf).read_bytes()).hexdigest(),
             "identity_verified": "true",
         }], RESULT_FIELDS)
         write_csv(self.root / "04_library_index/PAPER_INDEX.csv", [{
             "paper_id": "P1", "title": "Paper", "doi": "10/test",
             "pdf_path": str(relative_pdf), "source_batch_id": "DL-1",
             "identity_verified": "true",
+            "sha256": hashlib.sha256((self.root / relative_pdf).read_bytes()).hexdigest(),
         }], PAPER_INDEX_FIELDS)
         write_csv(batch / "outputs/fulltext_screening_queue.csv", [self.queue_row(
             fulltext_path=str(relative_pdf),

@@ -3,13 +3,13 @@
   "title": "论文下载工作区",
   "created_at": "2026-10-13T12:45:08+00:00",
   "workspace_version": 1,
-  "coordinator": "mac-local-coordinator",
+  "coordinator": "local-coordinator",
   "default_status": "READY",
   "local_machine_only": false,
-  "hosts": [
-    "mac",
-    "capg"
+  "host_roles": [
+    "coordinator",
+    "compute-worker"
   ],
-  "github_visibility": "private",
+  "github_visibility": "public",
   "runtime_sync": "directional"
 }

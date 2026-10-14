@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="/data1/sg/paper-workspace"
-asreview="/data1/sg/tools/asreview/.venv/bin/asreview"
+root="${PAPER_DOWNLOAD_WORKSPACE_ROOT:?set PAPER_DOWNLOAD_WORKSPACE_ROOT}"
+asreview="${ASREVIEW_EXECUTABLE:?set ASREVIEW_EXECUTABLE}"
 mkdir -p "$root/runtime/asreview" "$root/runtime/logs"
 
 if ss -ltn | grep -q "127.0.0.1:5001"; then

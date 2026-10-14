@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.util
 import json
 import sys
@@ -437,7 +438,227 @@ class AcceptBatchValidationTests(unittest.TestCase):
         self.assertEqual(len(paper_rows), 1)
         self.assertEqual(paper_rows[0]["pdf_path"], str(pdf))
         self.assertTrue(paper_rows[0]["sha256"])
+        self.assertEqual(paper_rows[0]["source_item_id"], "I-1")
+        self.assertEqual(paper_rows[0]["source_kind"], "pdf")
+        self.assertEqual(paper_rows[0]["mineru_md_path"], "")
+        self.assertEqual(paper_rows[0]["processed_text_sha256"], "")
+        self.assertEqual(paper_rows[0]["section_chunks_path"], "")
+        self.assertEqual(paper_rows[0]["section_chunks_sha256"], "")
+        self.assertEqual(paper_rows[0]["section_chunks_count"], "")
+        self.assertEqual(paper_rows[0]["section_chunks_schema_version"], "")
         self.assertTrue((self.root / "03_review/DL-TEST-acceptance.md").is_file())
+        self.assertFalse(
+            accept_batch.acceptance_transaction_dir(self.root, "DL-TEST").exists())
+
+    def test_partial_acceptance_commit_rolls_forward_on_rerun(self) -> None:
+        pdf = self.batch / "outputs/files/good.pdf"
+        pdf.write_bytes(b"nonempty")
+        self._result(pdf_path=str(pdf))
+        index_path = self._prepare_batch_state()
+        argv = [
+            "accept_batch.py", "DL-TEST", "--actor-role", "coordinator",
+            "--root", str(self.root),
+        ]
+        original_install = accept_batch.install_transaction_target
+        installed: list[str] = []
+
+        def fail_after_two_targets(root: Path, batch_id: str,
+                                   entry: dict[str, object], payload: bytes) -> None:
+            if len(installed) == 2:
+                raise OSError("injected crash between target replacements")
+            original_install(root, batch_id, entry, payload)
+            installed.append(str(entry["relative_path"]))
+
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(accept_batch, "load_builder", return_value=FakeBuilder()), \
+                mock.patch.object(
+                    accept_batch, "install_transaction_target",
+                    side_effect=fail_after_two_targets):
+            first_code = accept_batch.main()
+
+        transaction_dir = accept_batch.acceptance_transaction_dir(self.root, "DL-TEST")
+        self.assertEqual(first_code, 1)
+        self.assertEqual(installed, [
+            accept_batch.PAPER_INDEX.as_posix(),
+            accept_batch.MANUAL_BACKLOG.as_posix(),
+        ])
+        self.assertTrue((transaction_dir / "prepared.json").is_file())
+        prepared = json.loads(
+            (transaction_dir / "prepared.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [entry["relative_path"] for entry in prepared["targets"]],
+            accept_batch.transaction_target_paths("DL-TEST"),
+        )
+        for entry in prepared["targets"]:
+            payload = (transaction_dir / entry["payload"]).read_bytes()
+            self.assertEqual(len(payload), entry["size"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), entry["sha256"])
+        self.assertTrue((self.root / accept_batch.PAPER_INDEX).is_file())
+        self.assertTrue((self.root / accept_batch.MANUAL_BACKLOG).is_file())
+        self.assertFalse((self.root / "03_review/DL-TEST-acceptance.md").exists())
+        self.assertEqual(accept_batch.read_csv(index_path)[0]["status"], "REVIEW")
+        self.assertEqual(
+            json.loads((self.batch / "STATUS.json").read_text(encoding="utf-8"))["status"],
+            "REVIEW",
+        )
+
+        # Recovery happens before the REVIEW/ACCEPTED consistency checks and
+        # must not rerun the expensive validation path.
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(accept_batch, "load_builder") as load_builder:
+            second_code = accept_batch.main()
+
+        self.assertEqual(second_code, 0)
+        load_builder.assert_not_called()
+        self.assertFalse(transaction_dir.exists())
+        self.assertEqual(accept_batch.read_csv(index_path)[0]["status"], "ACCEPTED")
+        self.assertEqual(
+            json.loads((self.batch / "STATUS.json").read_text(encoding="utf-8"))["status"],
+            "ACCEPTED",
+        )
+        paper_rows = accept_batch.read_csv(self.root / accept_batch.PAPER_INDEX)
+        self.assertEqual([(row["source_batch_id"], row["source_item_id"])
+                          for row in paper_rows], [("DL-TEST", "I-1")])
+        self.assertTrue((self.root / "03_review/DL-TEST-acceptance.md").is_file())
+
+    def test_other_batch_recovers_global_pending_before_building_its_snapshot(self) -> None:
+        first_pdf = self.batch / "outputs/files/good.pdf"
+        first_pdf.write_bytes(b"first fulltext")
+        self._result(pdf_path=str(first_pdf))
+
+        second_batch = self.root / "02_batches/DL-SECOND"
+        (second_batch / "outputs/files").mkdir(parents=True)
+        second_manifest = {field: "" for field in accept_batch.MANIFEST_FIELDS}
+        second_manifest.update({
+            "item_id": "I-2", "paper_id": "P-2", "title": "Second paper",
+            "doi": "10.1234/second", "suggested_filename": "P-2.pdf",
+        })
+        self._write_csv(
+            second_batch / "MANIFEST.csv", accept_batch.MANIFEST_FIELDS,
+            [second_manifest],
+        )
+        second_pdf = second_batch / "outputs/files/good.pdf"
+        second_pdf.write_bytes(b"second fulltext")
+        second_result = {field: "" for field in accept_batch.DOWNLOAD_RESULT_FIELDS}
+        second_result.update({
+            "item_id": "I-2", "paper_id": "P-2", "status": "downloaded",
+            "title": "Second paper", "doi": "10.1234/second",
+            "pdf_path": str(second_pdf), "identity_verified": "true",
+        })
+        self._write_csv(
+            second_batch / "outputs/download_results.csv",
+            accept_batch.DOWNLOAD_RESULT_FIELDS, [second_result],
+        )
+        index_path = self.root / "00_control/BATCH_INDEX.csv"
+        index_fields = ["batch_id", "status", "updated_at", "accepted_at"]
+        self._write_csv(index_path, index_fields, [
+            {"batch_id": "DL-TEST", "status": "REVIEW",
+             "updated_at": "2026-10-13T00:00:00+00:00", "accepted_at": ""},
+            {"batch_id": "DL-SECOND", "status": "REVIEW",
+             "updated_at": "2026-10-13T00:00:00+00:00", "accepted_at": ""},
+        ])
+        for batch_id, batch_path in (("DL-TEST", self.batch),
+                                     ("DL-SECOND", second_batch)):
+            (batch_path / "STATUS.json").write_text(
+                json.dumps({"batch_id": batch_id, "status": "REVIEW"}) + "\n",
+                encoding="utf-8",
+            )
+
+        first_argv = [
+            "accept_batch.py", "DL-TEST", "--actor-role", "coordinator",
+            "--root", str(self.root),
+        ]
+        original_install = accept_batch.install_transaction_target
+        install_count = 0
+
+        def crash_first_batch(root: Path, batch_id: str,
+                              entry: dict[str, object], payload: bytes) -> None:
+            nonlocal install_count
+            if install_count == 2:
+                raise OSError("injected first-batch crash")
+            original_install(root, batch_id, entry, payload)
+            install_count += 1
+
+        with mock.patch.object(sys, "argv", first_argv), \
+                mock.patch.object(accept_batch, "load_builder", return_value=FakeBuilder()), \
+                mock.patch.object(
+                    accept_batch, "install_transaction_target",
+                    side_effect=crash_first_batch):
+            self.assertEqual(accept_batch.main(), 1)
+
+        self.assertEqual(
+            accept_batch.pending_transaction_batch_ids(self.root), ["DL-TEST"])
+
+        second_argv = [
+            "accept_batch.py", "DL-SECOND", "--actor-role", "coordinator",
+            "--root", str(self.root),
+        ]
+        with mock.patch.object(sys, "argv", second_argv), \
+                mock.patch.object(accept_batch, "load_builder", return_value=FakeBuilder()):
+            self.assertEqual(accept_batch.main(), 0)
+
+        self.assertEqual(accept_batch.pending_transaction_batch_ids(self.root), [])
+        paper_rows = accept_batch.read_csv(self.root / accept_batch.PAPER_INDEX)
+        self.assertEqual(
+            {(row["source_batch_id"], row["source_item_id"]) for row in paper_rows},
+            {("DL-TEST", "I-1"), ("DL-SECOND", "I-2")},
+        )
+        statuses = {
+            row["batch_id"]: row["status"] for row in accept_batch.read_csv(index_path)
+        }
+        self.assertEqual(statuses, {"DL-TEST": "ACCEPTED", "DL-SECOND": "ACCEPTED"})
+
+    def test_recovery_fails_closed_if_validated_fulltext_changes(self) -> None:
+        pdf = self.batch / "outputs/files/good.pdf"
+        pdf.write_bytes(b"original fulltext")
+        self._result(pdf_path=str(pdf))
+        index_path = self._prepare_batch_state()
+        argv = [
+            "accept_batch.py", "DL-TEST", "--actor-role", "coordinator",
+            "--root", str(self.root),
+        ]
+        original_install = accept_batch.install_transaction_target
+        install_count = 0
+
+        def crash_after_two(root: Path, batch_id: str,
+                            entry: dict[str, object], payload: bytes) -> None:
+            nonlocal install_count
+            if install_count == 2:
+                raise OSError("injected crash")
+            original_install(root, batch_id, entry, payload)
+            install_count += 1
+
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(accept_batch, "load_builder", return_value=FakeBuilder()), \
+                mock.patch.object(
+                    accept_batch, "install_transaction_target",
+                    side_effect=crash_after_two):
+            self.assertEqual(accept_batch.main(), 1)
+
+        pdf.write_bytes(b"mutated fulltext")
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(accept_batch, "load_builder") as load_builder:
+            self.assertEqual(accept_batch.main(), 1)
+
+        load_builder.assert_not_called()
+        self.assertEqual(accept_batch.read_csv(index_path)[0]["status"], "REVIEW")
+        self.assertEqual(
+            json.loads((self.batch / "STATUS.json").read_text(encoding="utf-8"))["status"],
+            "REVIEW",
+        )
+        self.assertEqual(
+            accept_batch.pending_transaction_batch_ids(self.root), ["DL-TEST"])
+
+    def test_path_traversal_batch_id_is_rejected_before_filesystem_access(self) -> None:
+        for unsafe_id in ("../DL-TEST", "DL..TEST", "DL-TEST.committed"):
+            with self.subTest(unsafe_id=unsafe_id):
+                argv = [
+                    "accept_batch.py", unsafe_id, "--actor-role", "coordinator",
+                    "--root", str(self.root),
+                ]
+                with mock.patch.object(sys, "argv", argv), self.assertRaisesRegex(
+                        SystemExit, "batch_id"):
+                    accept_batch.main()
 
     def test_successful_gap_batch_is_fully_registered_in_manual_backlog(self) -> None:
         self._result(status="failed")

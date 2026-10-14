@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 OUTPUT_FIELDS = [
     "paper_id", "title", "authors", "year", "journal", "doi", "landing_url",
     "priority", "download_reason", "requested_files", "source_database",

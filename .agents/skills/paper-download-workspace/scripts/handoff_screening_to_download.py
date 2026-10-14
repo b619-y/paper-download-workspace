@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 OUTPUT_FIELDS = [
     "paper_id", "title", "authors", "year", "journal", "doi", "landing_url",
     "priority", "download_reason", "requested_files", "source_database",
@@ -72,14 +72,61 @@ def validate_search_manifest(path: Path, allow_incomplete: bool) -> dict:
     if not path.is_file():
         raise ValueError(f"search manifest not found: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
-    source_states = {name: info.get("status") for name, info in (data.get("sources") or {}).items()}
-    bad = {name: state for name, state in source_states.items() if state != "complete"}
-    if (not data.get("complete") or bad) and not allow_incomplete:
+    if not isinstance(data, dict):
+        raise ValueError("search manifest must be a JSON object")
+
+    requested = data.get("requested_sources")
+    if (
+        not isinstance(requested, list)
+        or not requested
+        or any(not isinstance(name, str) or not name.strip() for name in requested)
+    ):
+        raise ValueError("search manifest requested_sources must be a non-empty list of source names")
+    requested = [name.strip() for name in requested]
+    if len(set(requested)) != len(requested):
+        raise ValueError("search manifest requested_sources contains duplicate source names")
+
+    sources = data.get("sources")
+    if not isinstance(sources, dict):
+        raise ValueError("search manifest sources must be an object")
+
+    complete = data.get("complete")
+    if type(complete) is not bool:
+        raise ValueError("search manifest complete must be a boolean")
+    gaps: dict[str, object] = {}
+    if complete is not True:
+        gaps["complete"] = complete
+    for name in requested:
+        if name not in sources:
+            gaps[name] = "missing"
+            continue
+        info = sources[name]
+        if not isinstance(info, dict):
+            raise ValueError(f"search manifest source {name} must be an object")
+        status = info.get("status")
+        if status != "complete":
+            gaps[name] = status if status is not None else "missing_status"
+
+    if gaps and not allow_incomplete:
         raise ValueError(
             "search run is incomplete; rerun failed/blocked sources or pass "
-            f"--allow-incomplete-search after disclosing the gap: {bad or source_states}"
+            f"--allow-incomplete-search after disclosing the gap: {gaps}"
         )
     return data
+
+
+def decision_reason(row: dict[str, str], decision: str) -> str:
+    """Return the explicit reason required for a screening decision."""
+    if decision == "exclude":
+        return str(row.get("exclusion_reason") or "").strip()
+    if decision == "uncertain":
+        return str(row.get("needs_fulltext_reason") or "").strip()
+    if decision == "download":
+        return (
+            str(row.get("matched_criteria") or "").strip()
+            or str(row.get("reason") or "").strip()
+        )
+    return ""
 
 
 def build_download_rows(rows: list[dict[str, str]], include_uncertain: bool,
@@ -99,6 +146,14 @@ def build_download_rows(rows: list[dict[str, str]], include_uncertain: bool,
             raise ValueError(f"row {line} requires DOI or title")
         if key in decisions and decisions[key] != decision:
             raise ValueError(f"duplicate record has conflicting decisions ({decisions[key]} vs {decision}): {key}")
+        reason = decision_reason(row, decision)
+        if not reason:
+            required = {
+                "exclude": "exclusion_reason",
+                "download": "matched_criteria or reason",
+                "uncertain": "needs_fulltext_reason",
+            }[decision]
+            raise ValueError(f"row {line} with decision={decision} requires {required}: {key}")
         if key in grouped:
             counts["duplicates_removed"] += 1
             current = grouped[key]
@@ -113,9 +168,7 @@ def build_download_rows(rows: list[dict[str, str]], include_uncertain: bool,
         decision = decisions[key]
         if decision == "exclude" or (decision == "uncertain" and not include_uncertain):
             continue
-        reason = row.get("matched_criteria") or row.get("needs_fulltext_reason")
-        if not reason:
-            raise ValueError(f"selected record lacks matched_criteria/needs_fulltext_reason: {key}")
+        reason = decision_reason(row, decision)
         notes = "; ".join(filter(None, (
             f"screening_decision={decision}",
             f"screening_basis={row.get('screening_basis', '')}" if row.get("screening_basis") else "",

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "DATA_EXTRACTION_SPEC_SCHEMA.json",
+  "title": "Task-scoped structured data extraction specification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["spec_version", "task_id", "title", "purpose", "fields"],
+  "properties": {
+    "spec_version": {"type": "string", "minLength": 1},
+    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "title": {"type": "string", "minLength": 1},
+    "purpose": {"type": "string", "minLength": 1},
+    "record_identity_fields": {
+      "type": "array",
+      "items": {"type": "string"},
+      "uniqueItems": true
+    },
+    "source_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fulltext_decisions": {
+          "type": "array",
+          "items": {"enum": ["include", "uncertain"]},
+          "uniqueItems": true
+        },
+        "notes": {"type": "string"}
+      }
+    },
+    "review_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["human_review_required"],
+      "properties": {
+        "human_review_required": {"const": true},
+        "instructions": {"type": "string"}
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "chunk_chars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 100000
+        },
+        "chunk_overlap": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000,
+          "description": "Runtime additionally requires chunk_overlap < chunk_chars and chunk_overlap <= chunk_chars / 2."
+        }
+      }
+    },
+    "fields": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["field_id", "label", "description", "data_type", "value_semantics"],
+        "properties": {
+          "field_id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$"},
+          "label": {"type": "string", "minLength": 1},
+          "description": {"type": "string", "minLength": 1},
+          "data_type": {"enum": ["string", "number", "integer", "boolean", "category", "date"]},
+          "required": {"type": "boolean"},
+          "multiple": {"type": "boolean"},
+          "value_semantics": {
+            "enum": ["measured", "reported", "derived", "categorical", "identifier", "date", "free_text"]
+          },
+          "unit": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "required": {"type": "boolean"},
+              "allowed": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+            }
+          },
+          "allowed_values": {"type": "array", "items": {}},
+          "notes": {"type": "string"}
+        }
+      }
+    }
+  }
+}

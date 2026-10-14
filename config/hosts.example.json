@@ -1,15 +1,16 @@
 {
-  "mac": {
-    "workspace": "/Users/b/Desktop/智能体/论文下载工作区",
-    "runtime": "/Users/b/Desktop/智能体/论文下载工作区/runtime"
+  "coordinator": {
+    "workspace_env": "PAPER_DOWNLOAD_WORKSPACE_ROOT",
+    "runtime_env": "PAPER_SYNC_MAC_ROOT"
   },
-  "capg": {
-    "ssh_alias": "capg",
-    "workspace": "/data1/sg/paper-workspace",
-    "runtime": "/data1/sg/paper-workspace/runtime",
-    "asreview": "/data1/sg/tools/asreview/.venv/bin/asreview",
-    "paperqa_python": "/data1/sg/tools/paperqa/.venv/bin/python",
-    "codex": "/usr/bin/codex",
-    "luna_model": "gpt-5.6-luna"
-  }
+  "compute_worker": {
+    "ssh_target_env": "PAPER_SYNC_REMOTE_HOST",
+    "workspace_env": "PAPER_REMOTE_WORKSPACE_ROOT",
+    "runtime_env": "PAPER_SYNC_REMOTE_ROOT",
+    "asreview_executable_env": "ASREVIEW_EXECUTABLE",
+    "paperqa_python_env": "PAPERQA_PYTHON",
+    "codex_executable_env": "CODEX_EXECUTABLE",
+    "luna_model_env": "PAPER_LUNA_MODEL"
+  },
+  "notes": "Set host names, ports, user names and absolute paths in ignored local environment/configuration, never in this public template."
 }

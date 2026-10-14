@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "PAPERQA_EVIDENCE_SCHEMA.json",
+  "title": "PaperQA-style candidate evidence marker",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "mode",
+    "completed",
+    "job_id",
+    "question",
+    "question_sha256",
+    "spec_version",
+    "spec_sha256",
+    "parser",
+    "retriever",
+    "embedding_base_url",
+    "embedding_error",
+    "model",
+    "source_bindings",
+    "candidate_count",
+    "candidates",
+    "result",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "mode": {"enum": ["judged", "retrieval_only"]},
+    "completed": {"type": "boolean"},
+    "job_id": {"type": "string", "minLength": 1},
+    "question": {"type": "string", "minLength": 1},
+    "question_sha256": {"$ref": "#/$defs/sha256"},
+    "spec_version": {"type": "string", "minLength": 1},
+    "spec_sha256": {"$ref": "#/$defs/sha256"},
+    "parser": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "retriever": {"type": "string", "minLength": 1},
+    "embedding_base_url": {"type": ["string", "null"]},
+    "embedding_error": {"type": ["string", "null"]},
+    "model": {"type": ["string", "null"]},
+    "source_bindings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/source_binding"}
+    },
+    "candidate_count": {"type": "integer", "minimum": 0, "maximum": 50},
+    "candidates": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"$ref": "#/$defs/candidate"}
+    },
+    "result": {"$ref": "#/$defs/result"},
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"mode": {"const": "judged"}}, "required": ["mode"]},
+      "then": {
+        "properties": {
+          "completed": {"const": true},
+          "model": {"type": "string", "minLength": 1},
+          "result": {
+            "properties": {
+              "evidence_status": {"enum": ["evidence_found", "no_evidence"]}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"mode": {"const": "retrieval_only"}}, "required": ["mode"]},
+      "then": {
+        "properties": {
+          "completed": {"const": false},
+          "model": {"type": "null"},
+          "result": {
+            "properties": {
+              "evidence_status": {"const": "retrieval_only"},
+              "evidence": {"maxItems": 0}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonical_section": {
+      "enum": [
+        "abstract",
+        "introduction",
+        "materials_methods",
+        "results",
+        "discussion",
+        "conclusion",
+        "supplement",
+        "references",
+        "table",
+        "figure",
+        "other"
+      ]
+    },
+    "heading_path": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "source_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paper_id",
+        "source_path",
+        "source_sha256",
+        "source_revalidation",
+        "source_file",
+        "source_format",
+        "parsed_text_path",
+        "parsed_text_sha256",
+        "parser",
+        "parser_version",
+        "sections_path",
+        "sections_sha256",
+        "sections_count",
+        "sections_schema_version",
+        "sections_origin"
+      ],
+      "properties": {
+        "paper_id": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "pattern": "^/"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "source_revalidation": {"enum": ["verified_local", "deferred_to_mac"]},
+        "source_file": {"type": "string", "minLength": 1},
+        "source_format": {"type": "string", "minLength": 1},
+        "parsed_text_path": {"type": "string", "pattern": "^/"},
+        "parsed_text_sha256": {"$ref": "#/$defs/sha256"},
+        "parser": {"type": "string", "minLength": 1},
+        "parser_version": {"type": "string", "minLength": 1},
+        "sections_path": {"type": "string", "pattern": "^/"},
+        "sections_sha256": {"$ref": "#/$defs/sha256"},
+        "sections_count": {"type": "integer", "minimum": 1},
+        "sections_schema_version": {"const": "1.0"},
+        "sections_origin": {
+          "enum": ["accepted_sidecar", "legacy_rebuilt", "direct_pdf_rebuilt"]
+        }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paper_id",
+        "source_path",
+        "source_sha256",
+        "source_revalidation",
+        "source_file",
+        "source_format",
+        "parsed_text_path",
+        "parsed_text_sha256",
+        "parser",
+        "parser_version",
+        "sections_path",
+        "sections_sha256",
+        "sections_count",
+        "sections_schema_version",
+        "sections_origin",
+        "chunk_id",
+        "section_chunk_id",
+        "section_chunk_text_sha256",
+        "source",
+        "page",
+        "section",
+        "canonical_section",
+        "original_heading",
+        "heading_path",
+        "table_or_figure",
+        "char_start",
+        "char_end",
+        "text",
+        "text_sha256",
+        "retrieval_score"
+      ],
+      "properties": {
+        "paper_id": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "pattern": "^/"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "source_revalidation": {"enum": ["verified_local", "deferred_to_mac"]},
+        "source_file": {"type": "string", "minLength": 1},
+        "source_format": {"type": "string", "minLength": 1},
+        "parsed_text_path": {"type": "string", "pattern": "^/"},
+        "parsed_text_sha256": {"$ref": "#/$defs/sha256"},
+        "parser": {"type": "string", "minLength": 1},
+        "parser_version": {"type": "string", "minLength": 1},
+        "sections_path": {"type": "string", "pattern": "^/"},
+        "sections_sha256": {"$ref": "#/$defs/sha256"},
+        "sections_count": {"type": "integer", "minimum": 1},
+        "sections_schema_version": {"const": "1.0"},
+        "sections_origin": {
+          "enum": ["accepted_sidecar", "legacy_rebuilt", "direct_pdf_rebuilt"]
+        },
+        "chunk_id": {"type": "string", "minLength": 1},
+        "section_chunk_id": {"type": "string", "minLength": 1},
+        "section_chunk_text_sha256": {"$ref": "#/$defs/sha256"},
+        "source": {"type": "string", "minLength": 1},
+        "page": {"type": ["integer", "string"]},
+        "section": {"type": "string"},
+        "canonical_section": {"$ref": "#/$defs/canonical_section"},
+        "original_heading": {"type": "string"},
+        "heading_path": {"$ref": "#/$defs/heading_path"},
+        "table_or_figure": {"enum": ["", "table", "figure", "mixed"]},
+        "char_start": {"type": "integer", "minimum": 0},
+        "char_end": {"type": "integer", "minimum": 1},
+        "text": {"type": "string", "minLength": 1},
+        "text_sha256": {"$ref": "#/$defs/sha256"},
+        "retrieval_score": {"type": "number"}
+      }
+    },
+    "verified_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chunk_id",
+        "source",
+        "page",
+        "exact_quote",
+        "reason",
+        "paper_id",
+        "source_path",
+        "source_sha256",
+        "source_revalidation",
+        "source_file",
+        "source_format",
+        "parsed_text_path",
+        "parsed_text_sha256",
+        "parser",
+        "parser_version",
+        "sections_path",
+        "sections_sha256",
+        "sections_count",
+        "sections_schema_version",
+        "sections_origin",
+        "section_chunk_id",
+        "section_chunk_text_sha256",
+        "section",
+        "canonical_section",
+        "original_heading",
+        "heading_path",
+        "table_or_figure",
+        "char_start",
+        "char_end",
+        "text_sha256",
+        "quote_verified",
+        "locator_status",
+        "evidence_authority"
+      ],
+      "properties": {
+        "chunk_id": {"type": "string", "minLength": 1},
+        "source": {"type": "string", "minLength": 1},
+        "page": {"type": ["integer", "string"]},
+        "exact_quote": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "paper_id": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "pattern": "^/"},
+        "source_sha256": {"$ref": "#/$defs/sha256"},
+        "source_revalidation": {"enum": ["verified_local", "deferred_to_mac"]},
+        "source_file": {"type": "string", "minLength": 1},
+        "source_format": {"type": "string", "minLength": 1},
+        "parsed_text_path": {"type": "string", "pattern": "^/"},
+        "parsed_text_sha256": {"$ref": "#/$defs/sha256"},
+        "parser": {"type": "string", "minLength": 1},
+        "parser_version": {"type": "string", "minLength": 1},
+        "sections_path": {"type": "string", "pattern": "^/"},
+        "sections_sha256": {"$ref": "#/$defs/sha256"},
+        "sections_count": {"type": "integer", "minimum": 1},
+        "sections_schema_version": {"const": "1.0"},
+        "sections_origin": {
+          "enum": ["accepted_sidecar", "legacy_rebuilt", "direct_pdf_rebuilt"]
+        },
+        "section_chunk_id": {"type": "string", "minLength": 1},
+        "section_chunk_text_sha256": {"$ref": "#/$defs/sha256"},
+        "section": {"type": "string"},
+        "canonical_section": {"$ref": "#/$defs/canonical_section"},
+        "original_heading": {"type": "string"},
+        "heading_path": {"$ref": "#/$defs/heading_path"},
+        "table_or_figure": {"enum": ["", "table", "figure", "mixed"]},
+        "char_start": {"type": "integer", "minimum": 0},
+        "char_end": {"type": "integer", "minimum": 1},
+        "text_sha256": {"$ref": "#/$defs/sha256"},
+        "quote_verified": {"const": true},
+        "locator_status": {"const": "candidate_locator"},
+        "evidence_authority": {"const": "original_pdf_or_xml"}
+      }
+    },
+    "rejected_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chunk_id", "source", "page", "exact_quote", "reason", "quote_verified"],
+      "properties": {
+        "chunk_id": {"type": "string"},
+        "source": {"type": "string"},
+        "page": {"type": ["integer", "string"]},
+        "exact_quote": {"type": "string"},
+        "reason": {"type": "string"},
+        "quote_verified": {"const": false}
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "answer",
+        "decision",
+        "uncertainty",
+        "evidence",
+        "rejected_evidence",
+        "evidence_status"
+      ],
+      "properties": {
+        "answer": {"type": "string"},
+        "decision": {"enum": ["include", "exclude", "uncertain"]},
+        "uncertainty": {"type": "string"},
+        "evidence": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {"$ref": "#/$defs/verified_evidence"}
+        },
+        "rejected_evidence": {
+          "type": "array",
+          "maxItems": 50,
+          "items": {"$ref": "#/$defs/rejected_evidence"}
+        },
+        "evidence_status": {
+          "enum": ["evidence_found", "no_evidence", "retrieval_only"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"evidence_status": {"const": "evidence_found"}},
+            "required": ["evidence_status"]
+          },
+          "then": {"properties": {"evidence": {"minItems": 1}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "evidence_status": {"enum": ["no_evidence", "retrieval_only"]}
+            },
+            "required": ["evidence_status"]
+          },
+          "then": {
+            "properties": {
+              "decision": {"const": "uncertain"},
+              "evidence": {"maxItems": 0}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

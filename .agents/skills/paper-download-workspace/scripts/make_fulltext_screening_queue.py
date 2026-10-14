@@ -8,7 +8,7 @@ import csv
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 SUCCESS = {"downloaded", "reused_verified"}
 FIELDS = [
     "item_id", "paper_id", "title", "doi", "fulltext_path", "fulltext_status",

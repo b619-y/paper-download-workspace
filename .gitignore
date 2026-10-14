@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+/config/*.local.json
+/config/hosts.json
 __pycache__/
 *.py[cod]
 .venv/
@@ -9,8 +11,37 @@ __pycache__/
 # 论文全文、授权会话和计算状态不进入 GitHub
 runtime/**
 !runtime/.gitkeep
-02_batches/**/outputs/files/**
-02_batches/**/inputs/search_screening/raw/**
+
+# 批次、审核、归档和动态索引是运行数据。公开仓库只保留
+# 01_shared/ 下的 schema/example，真实数据由初始化脚本在本机生成。
+/02_batches/**
+!/02_batches/.gitkeep
+/03_review/**
+!/03_review/.gitkeep
+/05_archive/**
+!/05_archive/.gitkeep
+/00_control/BATCH_INDEX.csv
+/00_control/DECISIONS.md
+/00_control/.queue.lock
+/00_control/.acceptance_transactions/**
+/04_library_index/PAPER_INDEX.csv.bak
+/03_review/MANUAL_DOWNLOAD_BACKLOG.csv.bak
+/04_library_index/PAPER_INDEX.csv
+
+# 文档处理队列、MinerU/XML 派生全文及数据提取结果。
+# 规则故意限定在真实运行根目录，不全局忽略 full.md、images/、
+# state/result/archive，以免误伤 tests/fixtures 或文档中的示例。
+/06_mineru/**
+!/06_mineru/.gitkeep
+/07_xml_markdown/**
+!/07_xml_markdown/.gitkeep
+/02_batches/*/outputs/document_processing/**
+/02_batches/*/outputs/data_extraction/**
+/runtime/inputs/*/documents/**
+/runtime/results/*/paperqa/**
+/runtime/results/*/data_extraction/**
+/runtime/results/*/document_processing/**
+
 *.pdf
 *.xml
 *.caj
@@ -25,6 +56,14 @@ runtime/**
 .paperqa/
 asreview-data/
 paperqa-state/
-*.sqlite
-*.db
+*.sqlite*
+*.SQLITE*
+*.db*
+*.DB*
+*-wal
+*-WAL
+*-shm
+*-SHM
+*-journal
+*-JOURNAL
 *.asreview

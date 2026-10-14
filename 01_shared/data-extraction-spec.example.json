@@ -1,0 +1,42 @@
+{
+  "spec_version": "1.0",
+  "task_id": "example-task",
+  "title": "示例：从已筛选全文中提取目标数据",
+  "purpose": "定义需要人工复核的通用结构化记录。",
+  "record_identity_fields": ["sample_id", "outcome"],
+  "source_scope": {
+    "fulltext_decisions": ["include", "uncertain"],
+    "notes": "摘要未报告或 PaperQA 未定位到证据，不代表数据不存在。"
+  },
+  "review_policy": {
+    "human_review_required": true,
+    "instructions": "接受记录前回到原 PDF/XML 核对引文、表格和单位。"
+  },
+  "model": {
+    "name": "gpt-5.6-luna",
+    "chunk_chars": 12000,
+    "chunk_overlap": 800
+  },
+  "fields": [
+    {
+      "field_id": "sample_id",
+      "label": "样本识别符",
+      "description": "论文用于区分样本或实验组的原文识别符。",
+      "data_type": "string",
+      "required": true,
+      "multiple": false,
+      "value_semantics": "identifier",
+      "unit": {"required": false, "allowed": []}
+    },
+    {
+      "field_id": "outcome",
+      "label": "目标数值",
+      "description": "待建模或分析的目标观测值。",
+      "data_type": "number",
+      "required": true,
+      "multiple": false,
+      "value_semantics": "reported",
+      "unit": {"required": true, "allowed": ["mg/kg", "mg/L"]}
+    }
+  ]
+}

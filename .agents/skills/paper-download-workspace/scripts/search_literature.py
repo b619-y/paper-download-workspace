@@ -71,7 +71,9 @@ def redact_url(url: str) -> str:
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    # Preserve sub-second ordering so a coordinator can distinguish two runs
+    # that start or finish within the same wall-clock second.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def clean_text(value: Any) -> str:

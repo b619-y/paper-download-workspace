@@ -12,6 +12,8 @@
     "<必填：全文中要找的字段、方法或数据>"
   ],
   "requires_fulltext_screening": true,
+  "requires_document_processing": true,
+  "requires_data_extraction": true,
   "target_sources": [
     "openalex",
     "crossref",

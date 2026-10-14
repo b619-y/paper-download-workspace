@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small OpenAI-compatible BGE-M3 embedding service for capg2."""
+"""Small OpenAI-compatible BGE-M3 embedding service for a dedicated worker."""
 
 from __future__ import annotations
 

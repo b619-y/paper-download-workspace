@@ -9,7 +9,7 @@
     reference_existing），需要重建投影，避免下载Agent下到已经有的论文。
 
 用法：
-    python3 make_download_csv.py <batch_id> [--root /Users/b/Desktop/论文下载]
+    python3 make_download_csv.py <batch_id> [--root /path/to/paper-workspace]
     python3 make_download_csv.py --all
 
 只读 MANIFEST.csv，只写该批次的 `outputs/zju_papers.csv`；不动任何其他文件。
@@ -22,7 +22,7 @@ import csv
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 FIELDS = ["doi", "paper_id", "suggested_filename", "title"]
 
 

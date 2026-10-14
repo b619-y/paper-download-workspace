@@ -18,6 +18,8 @@
    * `03_review/<batch_id>-acceptance.md` ← 验收记录；
    * 在同一批次锁临界区内校验并置 `ACCEPTED`；`update_batch_status.py`
      不允许绕过本验收闸门直接写 `ACCEPTED`。
+   * 五个权威目标先写入带 SHA-256 的 prepared transaction；任一
+     `os.replace` 之间中断时，重跑同一命令会在读状态前自动向前补齐。
 
     python3 accept_batch.py <batch_id> --actor-role coordinator --dry-run
     python3 accept_batch.py <batch_id> --actor-role coordinator
@@ -31,6 +33,7 @@ import argparse
 import csv
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -38,22 +41,24 @@ import shutil
 import importlib.util
 import subprocess
 import sys
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 PAPER_INDEX = Path("04_library_index/PAPER_INDEX.csv")
 MANUAL_BACKLOG = Path("03_review/MANUAL_DOWNLOAD_BACKLOG.csv")
 #: 必须与 04_library_index/PAPER_INDEX.csv 的**列顺序**完全一致（追加行是按本列表写的；
 #: 顺序不一致会把值写进错误的列）。新增列只能追加在末尾。
 PAPER_FIELDS = ["paper_id", "title", "doi", "pdf_path", "supplement_paths", "sha256",
                 "source_batch_id", "identity_verified", "accepted_at", "notes",
-                "mineru_md_path", "xml_md_path"]
-
-#: 派生全文（MinerU Markdown / TDM XML→Markdown）的默认落点（相对工作区根）
-DERIVED_MD_DIRS = {"mineru_md_path": "06_mineru", "xml_md_path": "07_xml_markdown"}
+                "mineru_md_path", "xml_md_path", "source_item_id", "document_id",
+                "source_kind", "processed_text_sha256", "processing_method",
+                "processing_version", "processing_accepted_at", "section_chunks_path",
+                "section_chunks_sha256", "section_chunks_count",
+                "section_chunks_schema_version"]
 BACKLOG_FIELDS = ["batch_id", "item_id", "paper_id", "doi", "title", "status", "reason_code",
                   "reason", "attempted_channels", "needs", "owner", "reported_at",
                   "resolved_at", "resolution_batch_id", "notes"]
@@ -69,11 +74,398 @@ MANIFEST_FIELDS = [
     "queue_action", "existing_batch_id", "notes",
 ]
 MANUAL_STATUSES = {"not_found", "paywalled", "access_denied", "identity_mismatch", "failed"}
+SAFE_BATCH_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+TRANSACTION_VERSION = 1
+TRANSACTION_DIR = Path("00_control/.acceptance_transactions")
 COMMON_IDENTITY_TOKENS = {
     "abstract", "article", "conclusion", "download", "fulltext", "introduction",
     "journal", "method", "methods", "paper", "research", "result", "results",
     "study", "supplement", "water", "soil", "groundwater", "environmental",
 }
+
+
+def validate_batch_id(value: str) -> str:
+    """Reject path traversal and ambiguous filesystem spellings before path joins."""
+    if (not SAFE_BATCH_ID_RE.fullmatch(value or "") or value in {".", ".."}
+            or ".." in value or value.casefold().endswith(".committed")
+            or Path(value).name != value):
+        raise SystemExit(
+            "batch_id 只能包含 ASCII 字母、数字、点、下划线和连字符，"
+            "且不得包含路径分隔符、'..' 或保留后缀 '.committed'")
+    return value
+
+
+def fsync_directory(path: Path) -> None:
+    """Persist directory-entry updates where the host filesystem supports it."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Durably replace one file with bytes written in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def render_csv_bytes(fields: list[str], rows: list[dict[str, str]]) -> bytes:
+    """Render the exact UTF-8-with-BOM CSV representation used by workspace indexes."""
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def transaction_target_paths(batch_id: str) -> list[str]:
+    """Return the fixed, ordered roll-forward set; status files are commit markers."""
+    validate_batch_id(batch_id)
+    return [
+        PAPER_INDEX.as_posix(),
+        MANUAL_BACKLOG.as_posix(),
+        f"03_review/{batch_id}-acceptance.md",
+        f"02_batches/{batch_id}/STATUS.json",
+        "00_control/BATCH_INDEX.csv",
+    ]
+
+
+def acceptance_transaction_dir(root: Path, batch_id: str) -> Path:
+    validate_batch_id(batch_id)
+    candidate = root / TRANSACTION_DIR / "pending" / batch_id
+    resolved_parent = candidate.parent.resolve(strict=False)
+    resolved_root = root.resolve()
+    if resolved_parent == resolved_root or resolved_root not in resolved_parent.parents:
+        raise RuntimeError(f"验收事务目录越界：{candidate}")
+    return candidate
+
+
+def committed_transaction_dir(root: Path, batch_id: str) -> Path:
+    validate_batch_id(batch_id)
+    candidate = root / TRANSACTION_DIR / "committed" / batch_id
+    resolved_parent = candidate.parent.resolve(strict=False)
+    resolved_root = root.resolve()
+    if resolved_parent == resolved_root or resolved_root not in resolved_parent.parents:
+        raise RuntimeError(f"已完成验收事务目录越界：{candidate}")
+    return candidate
+
+
+def pending_transaction_batch_ids(root: Path) -> list[str]:
+    """List pending batch journals without trusting directory names as paths."""
+    pending_root = root / TRANSACTION_DIR / "pending"
+    if not pending_root.exists():
+        return []
+    if pending_root.is_symlink() or not pending_root.is_dir():
+        raise RuntimeError(f"验收 pending 路径不是普通目录：{pending_root}")
+    batch_ids: list[str] = []
+    for child in pending_root.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            raise RuntimeError(f"验收 pending 中存在非法项：{child}")
+        try:
+            batch_ids.append(validate_batch_id(child.name))
+        except SystemExit as exc:
+            raise RuntimeError(f"验收 pending 目录名非法：{child.name!r}") from exc
+    return sorted(batch_ids)
+
+
+def _safe_transaction_target(root: Path, batch_id: str, relative: str) -> Path:
+    expected = set(transaction_target_paths(batch_id))
+    if relative not in expected:
+        raise RuntimeError(f"验收事务包含非法目标：{relative!r}")
+    candidate = root / Path(relative)
+    resolved_root = root.resolve()
+    resolved_candidate = candidate.resolve(strict=False)
+    if resolved_candidate == resolved_root or resolved_root not in resolved_candidate.parents:
+        raise RuntimeError(f"验收事务目标越界：{relative!r}")
+    return candidate
+
+
+def snapshot_dependency(path: Path, label: str,
+                        expected_sha256: str = "") -> dict[str, object]:
+    """Bind a prepared transaction to one immutable-on-replay input file."""
+    path = path.expanduser()
+    if not path.is_file():
+        raise RuntimeError(f"验收事务依赖不存在：{label} -> {path}")
+    resolved = path.resolve(strict=True)
+    digest = file_sha256(path)
+    if expected_sha256 and digest != expected_sha256:
+        raise RuntimeError(f"验收事务依赖在准备前已变化：{label}")
+    return {
+        "label": label,
+        "path": str(path),
+        "resolved_path": str(resolved),
+        "sha256": digest,
+        "size": path.stat().st_size,
+    }
+
+
+def build_acceptance_dependencies(
+        batch: Path, success_rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    """Snapshot authoritative inputs needed to justify the prepared outputs."""
+    dependencies = [
+        snapshot_dependency(batch / "MANIFEST.csv", "manifest"),
+        snapshot_dependency(batch / "outputs/download_results.csv", "download_results"),
+        snapshot_dependency(batch / "outputs/manual_backlog.csv", "manual_backlog"),
+    ]
+    for row in success_rows:
+        item_id = row.get("item_id", "")
+        payload = Path(row.get("pdf_path") or "")
+        dependencies.append(snapshot_dependency(
+            payload,
+            f"fulltext:{item_id}",
+            row.get("_validated_payload_sha256", ""),
+        ))
+    return dependencies
+
+
+def verify_transaction_dependencies(raw_dependencies: object) -> None:
+    """Fail closed if any source used during validation changed before replay."""
+    if not isinstance(raw_dependencies, list) or len(raw_dependencies) < 3:
+        raise RuntimeError("验收事务缺少必需依赖快照")
+    labels: set[str] = set()
+    for dependency in raw_dependencies:
+        if not isinstance(dependency, dict):
+            raise RuntimeError("验收事务依赖项格式错误")
+        label = dependency.get("label")
+        path_text = dependency.get("path")
+        resolved_text = dependency.get("resolved_path")
+        digest = dependency.get("sha256")
+        size = dependency.get("size")
+        if (not isinstance(label, str) or not label or label in labels
+                or not isinstance(path_text, str) or not path_text
+                or not isinstance(resolved_text, str) or not resolved_text
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not isinstance(size, int) or size < 0):
+            raise RuntimeError("验收事务依赖项缺少必需字段或重复")
+        labels.add(label)
+        path = Path(path_text)
+        try:
+            current_resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError(f"验收事务依赖已丢失：{label}") from exc
+        if (not path.is_file() or str(current_resolved) != resolved_text
+                or path.stat().st_size != size or file_sha256(path) != digest):
+            raise RuntimeError(f"验收事务依赖已变化：{label}")
+    if not {"manifest", "download_results", "manual_backlog"} <= labels:
+        raise RuntimeError("验收事务依赖快照不完整")
+
+
+def prepare_acceptance_transaction(
+        root: Path, batch_id: str, target_payloads: dict[str, bytes],
+        dependencies: list[dict[str, object]]) -> Path:
+    """Write every payload and its digest before publishing the prepared manifest."""
+    expected = transaction_target_paths(batch_id)
+    if list(target_payloads) != expected:
+        raise RuntimeError("验收事务的目标集或顺序与合同不一致")
+
+    transaction_dir = acceptance_transaction_dir(root, batch_id)
+    committed_dir = committed_transaction_dir(root, batch_id)
+    transaction_parent = transaction_dir.parent
+    committed_parent = committed_dir.parent
+    transaction_parent.mkdir(parents=True, exist_ok=True)
+    committed_parent.mkdir(parents=True, exist_ok=True)
+    pending_ids = pending_transaction_batch_ids(root)
+    if pending_ids and pending_ids != [batch_id]:
+        raise RuntimeError(
+            f"其他批次尚有待恢复验收事务：{pending_ids}")
+    if committed_dir.is_symlink():
+        raise RuntimeError(f"已完成验收事务目录不得是符号链接：{committed_dir}")
+    if committed_dir.exists():
+        if not committed_dir.is_dir():
+            raise RuntimeError(f"已完成验收事务路径不是目录：{committed_dir}")
+        shutil.rmtree(committed_dir)
+        fsync_directory(committed_parent)
+    if transaction_dir.is_symlink():
+        raise RuntimeError(f"验收事务目录不得是符号链接：{transaction_dir}")
+    if transaction_dir.exists():
+        # A directory without prepared.json can only be an interrupted prepare:
+        # replay never starts before the manifest has been atomically published.
+        if (transaction_dir / "prepared.json").exists():
+            raise RuntimeError(f"存在未恢复的验收事务：{transaction_dir}")
+        shutil.rmtree(transaction_dir)
+        fsync_directory(transaction_parent)
+    transaction_dir.mkdir()
+    fsync_directory(transaction_parent)
+
+    entries: list[dict[str, object]] = []
+    for ordinal, relative in enumerate(expected):
+        payload = target_payloads[relative]
+        suffix = Path(relative).suffix or ".bin"
+        payload_name = f"{ordinal:02d}-{Path(relative).stem}{suffix}"
+        atomic_write_bytes(transaction_dir / payload_name, payload)
+        entries.append({
+            "relative_path": relative,
+            "payload": payload_name,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        })
+
+    manifest = {
+        "version": TRANSACTION_VERSION,
+        "batch_id": batch_id,
+        "prepared_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        "dependencies": dependencies,
+        "targets": entries,
+    }
+    manifest_bytes = (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    # Publishing prepared.json is the prepare/commit boundary. No target is
+    # touched before this durable atomic write completes.
+    atomic_write_bytes(transaction_dir / "prepared.json", manifest_bytes)
+    return transaction_dir
+
+
+def _load_prepared_transaction(
+        root: Path, batch_id: str, transaction_dir: Path) \
+        -> tuple[list[tuple[dict[str, object], bytes]], list[dict[str, object]]]:
+    manifest_path = transaction_dir / "prepared.json"
+    if manifest_path.is_symlink():
+        raise RuntimeError("验收事务清单不得是符号链接")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"验收事务清单无法读取：{exc}") from exc
+    if manifest.get("version") != TRANSACTION_VERSION:
+        raise RuntimeError("验收事务版本不受支持")
+    if manifest.get("batch_id") != batch_id:
+        raise RuntimeError("验收事务 batch_id 与路径不一致")
+    raw_dependencies = manifest.get("dependencies")
+    verify_transaction_dependencies(raw_dependencies)
+    assert isinstance(raw_dependencies, list)
+    targets = manifest.get("targets")
+    if not isinstance(targets, list):
+        raise RuntimeError("验收事务 targets 必须是数组")
+    relative_paths = [entry.get("relative_path") if isinstance(entry, dict) else None
+                      for entry in targets]
+    if relative_paths != transaction_target_paths(batch_id):
+        raise RuntimeError("验收事务目标集或顺序被篡改")
+
+    verified: list[tuple[dict[str, object], bytes]] = []
+    for entry in targets:
+        if not isinstance(entry, dict):
+            raise RuntimeError("验收事务目标项格式错误")
+        relative = entry.get("relative_path")
+        payload_name = entry.get("payload")
+        digest = entry.get("sha256")
+        size = entry.get("size")
+        if (not isinstance(relative, str) or not isinstance(payload_name, str)
+                or not isinstance(digest, str) or not isinstance(size, int)):
+            raise RuntimeError("验收事务目标项缺少必需字段")
+        _safe_transaction_target(root, batch_id, relative)
+        if Path(payload_name).name != payload_name or payload_name in {".", ".."}:
+            raise RuntimeError(f"验收事务载荷路径非法：{payload_name!r}")
+        payload_path = transaction_dir / payload_name
+        if payload_path.is_symlink() or not payload_path.is_file():
+            raise RuntimeError(f"验收事务载荷不存在：{payload_name}")
+        payload = payload_path.read_bytes()
+        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeError(f"验收事务载荷哈希不一致：{payload_name}")
+        verified.append((entry, payload))
+    return verified, raw_dependencies
+
+
+def install_transaction_target(root: Path, batch_id: str,
+                               entry: dict[str, object], payload: bytes) -> None:
+    """Install one verified target; split out so tests can inject a crash."""
+    relative = entry["relative_path"]
+    if not isinstance(relative, str):
+        raise RuntimeError("验收事务目标路径类型错误")
+    target = _safe_transaction_target(root, batch_id, relative)
+    atomic_write_bytes(target, payload)
+
+
+def recover_prepared_acceptance(root: Path, batch_id: str) -> bool:
+    """Roll a prepared acceptance transaction forward, idempotently.
+
+    This function must run while holding ``00_control/.queue.lock`` and before
+    reading either status file. It verifies *all* payloads first, then replaces
+    targets in a fixed order. A second crash simply causes the next run to
+    replay the same hashed bytes.
+    """
+    transaction_dir = acceptance_transaction_dir(root, batch_id)
+    if not transaction_dir.exists():
+        return False
+    if transaction_dir.is_symlink() or not transaction_dir.is_dir():
+        raise RuntimeError(f"验收事务路径不是普通目录：{transaction_dir}")
+    manifest_path = transaction_dir / "prepared.json"
+    if not manifest_path.exists():
+        # Interrupted preparation is safe to discard: target replacement is
+        # never entered until prepared.json has been durably published.
+        shutil.rmtree(transaction_dir)
+        fsync_directory(transaction_dir.parent)
+        return False
+
+    verified, dependencies = _load_prepared_transaction(root, batch_id, transaction_dir)
+    for ordinal, (entry, payload) in enumerate(verified):
+        # Re-check immediately before publishing either status file, so source
+        # mutation cannot turn a partial data update into a visible ACCEPTED
+        # generation. A failed check leaves the prepared journal in place and
+        # blocks all later accepts until the source is restored or audited.
+        if ordinal == 3:
+            verify_transaction_dependencies(dependencies)
+        relative = entry["relative_path"]
+        target = _safe_transaction_target(root, batch_id, str(relative))
+        digest = str(entry["sha256"])
+        if target.is_symlink() or not target.is_file() or file_sha256(target) != digest:
+            install_transaction_target(root, batch_id, entry, payload)
+        if target.is_symlink() or not target.is_file() or file_sha256(target) != digest:
+            raise RuntimeError(f"验收事务目标写入后校验失败：{relative}")
+
+    verify_transaction_dependencies(dependencies)
+
+    # Atomically retire the pending name. If the process dies during optional
+    # cleanup, no future run can mistake a half-deleted payload set for a
+    # recoverable prepared transaction.
+    committed_dir = committed_transaction_dir(root, batch_id)
+    if committed_dir.exists():
+        if committed_dir.is_symlink() or not committed_dir.is_dir():
+            raise RuntimeError(f"已完成验收事务路径异常：{committed_dir}")
+        shutil.rmtree(committed_dir)
+        fsync_directory(committed_dir.parent)
+    os.replace(transaction_dir, committed_dir)
+    fsync_directory(transaction_dir.parent)
+    fsync_directory(committed_dir.parent)
+    try:
+        shutil.rmtree(committed_dir)
+        fsync_directory(committed_dir.parent)
+    except OSError:
+        # The authoritative targets are already fully verified and the pending
+        # name is gone. A leftover committed directory is harmless and will be
+        # removed before the next reaccept transaction.
+        pass
+    return True
+
+
+def recover_all_prepared_acceptances(root: Path) -> list[str]:
+    """Recover the one globally serialized pending acceptance, if present.
+
+    ``.queue.lock`` serializes transaction preparation, so correct operation
+    can leave at most one pending journal. Multiple journals cannot be safely
+    ordered from full-file snapshots and therefore fail closed instead of
+    guessing and risking lost global-index updates.
+    """
+    batch_ids = pending_transaction_batch_ids(root)
+    if len(batch_ids) > 1:
+        raise RuntimeError(
+            "同时存在多个验收 pending 事务，无法安全确定全局快照顺序："
+            f"{batch_ids}")
+    recovered: list[str] = []
+    for pending_batch_id in batch_ids:
+        if recover_prepared_acceptance(root, pending_batch_id):
+            recovered.append(pending_batch_id)
+    return recovered
 
 
 def load_builder():
@@ -288,12 +680,7 @@ def persist_validated_results(path: Path, success_rows: list[dict[str, str]],
     if merged == rows:
         return False
     backup_once(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(merged)
-    os.replace(tmp, path)
+    atomic_write_bytes(path, render_csv_bytes(fields, merged))
     return True
 
 
@@ -451,15 +838,33 @@ def main() -> int:
     if args.actor_role != "coordinator":
         raise SystemExit("只有协调Agent可以验收批次（--actor-role coordinator）")
 
+    batch_id = validate_batch_id(args.batch_id)
     root = Path(args.root).expanduser().resolve()
-    batch = root / "02_batches" / args.batch_id
-    if not (batch / "MANIFEST.csv").is_file():
-        raise SystemExit(f"批次不存在：{batch}")
+    batch = root / "02_batches" / batch_id
+    batches_root = (root / "02_batches").resolve(strict=False)
+    if (root not in batches_root.parents or batch.is_symlink()
+            or batch.resolve(strict=False).parent != batches_root):
+        raise SystemExit(f"批次路径越出工作区：{batch}")
 
     reaccept = bool(args.reaccept)
     lock_path = root / "00_control/.queue.lock"
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        # A prior process may have died after replacing only some of the five
+        # authoritative files. Recover before reading either status file.
+        try:
+            recovered_batch_ids = recover_all_prepared_acceptances(root)
+        except (OSError, RuntimeError) as exc:
+            print(f"  ERROR 未能恢复已准备的验收事务：{exc}")
+            print("验收中止：事务已保留，修复存储问题后重跑同一命令")
+            return 1
+        if recovered_batch_ids:
+            print(
+                "  已自动补齐上次中断的验收事务："
+                + ", ".join(recovered_batch_ids))
+
+        if not (batch / "MANIFEST.csv").is_file():
+            raise SystemExit(f"批次不存在：{batch}")
         index_path = root / "00_control/BATCH_INDEX.csv"
         with index_path.open(encoding="utf-8-sig", newline="") as handle:
             index_reader = csv.DictReader(handle)
@@ -469,36 +874,51 @@ def main() -> int:
         if not required_index_fields <= set(index_fields):
             raise SystemExit(
                 f"BATCH_INDEX.csv 缺少状态字段：{sorted(required_index_fields - set(index_fields))}")
-        index_row = next((row for row in index if row.get("batch_id") == args.batch_id), None)
+        index_row = next((row for row in index if row.get("batch_id") == batch_id), None)
         if index_row is None:
-            raise SystemExit(f"BATCH_INDEX.csv 里没有 {args.batch_id}")
+            raise SystemExit(f"BATCH_INDEX.csv 里没有 {batch_id}")
 
         status_path = batch / "STATUS.json"
         if not status_path.is_file():
-            raise SystemExit(f"{args.batch_id} 缺 STATUS.json")
+            raise SystemExit(f"{batch_id} 缺 STATUS.json")
         status_doc = json.loads(status_path.read_text(encoding="utf-8"))
+        if status_doc.get("batch_id") != batch_id:
+            raise SystemExit(
+                f"{batch_id} STATUS.json 的 batch_id 不一致："
+                f"{status_doc.get('batch_id')!r}")
         index_status = (index_row.get("status") or "").strip()
         batch_status = (status_doc.get("status") or "").strip()
         if index_status != batch_status:
             raise SystemExit(
-                f"{args.batch_id} 状态不一致：BATCH_INDEX={index_status}, STATUS.json={batch_status}")
+                f"{batch_id} 状态不一致：BATCH_INDEX={index_status}, STATUS.json={batch_status}")
 
         existing_papers = read_csv(root / PAPER_INDEX)
         existing_backlog = read_csv(root / MANUAL_BACKLOG)
-        already = any(row.get("source_batch_id") == args.batch_id for row in existing_papers)
-        if already and batch_status == "ACCEPTED" and not reaccept:
-            print(f"{args.batch_id}: 已是 ACCEPTED 且索引已登记，无需重复验收")
+        if batch_status == "ACCEPTED" and not reaccept:
+            # An all-gap accepted batch legitimately has no PAPER_INDEX rows;
+            # require its backlog/record instead of treating a bare status flip
+            # as a completed acceptance.
+            has_paper_rows = any(
+                row.get("source_batch_id") == batch_id for row in existing_papers)
+            has_backlog_rows = any(
+                row.get("batch_id") == batch_id for row in existing_backlog)
+            acceptance_record = root / "03_review" / f"{batch_id}-acceptance.md"
+            if not acceptance_record.is_file() or not (has_paper_rows or has_backlog_rows):
+                raise SystemExit(
+                    f"{batch_id} 已标 ACCEPTED，但验收索引/记录不完整；"
+                    "请用 --reaccept 重过闸门")
+            print(f"{batch_id}: 已是 ACCEPTED，无需重复验收")
             return 0
         if reaccept and batch_status != "ACCEPTED":
             raise SystemExit(
-                f"{args.batch_id} 当前状态 {batch_status}，--reaccept 只用于已 ACCEPTED 的批次")
+                f"{batch_id} 当前状态 {batch_status}，--reaccept 只用于已 ACCEPTED 的批次")
         if not reaccept and batch_status != "REVIEW":
-            raise SystemExit(f"{args.batch_id} 当前状态 {batch_status}，只有 REVIEW 可以验收")
+            raise SystemExit(f"{batch_id} 当前状态 {batch_status}，只有 REVIEW 可以验收")
 
         # 在同一 queue lock 临界区内重新读取并校验所有交付件。
         builder = load_builder()
         errors, success, gaps = validate(root, batch, builder)
-        print(f"批次 {args.batch_id}")
+        print(f"批次 {batch_id}")
         print(f"  条目: {len(success) + len(gaps)} | 成功 {len(success)} | 缺口 {len(gaps)}")
         for err in errors:
             print(f"  ERROR {err}")
@@ -508,21 +928,26 @@ def main() -> int:
 
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-        def derived_md(pid: str, subdir: str) -> str:
-            md = root / subdir / pid / "full.md"
-            return str(md) if md.is_file() and md.stat().st_size > 0 else ""
-
         paper_rows = [{
             "paper_id": row.get("paper_id", ""), "title": row.get("title", ""),
             "doi": row.get("doi", ""), "pdf_path": row.get("pdf_path", ""),
             "supplement_paths": row.get("supplement_paths", ""),
-            "sha256": row.get("sha256", ""), "source_batch_id": args.batch_id,
+            "sha256": row.get("sha256", ""), "source_batch_id": batch_id,
             "identity_verified": row.get("identity_verified", ""), "accepted_at": now,
             "notes": (row.get("notes", "") or "")[:300],
-            "mineru_md_path": derived_md(
-                row.get("paper_id", ""), DERIVED_MD_DIRS["mineru_md_path"]),
-            "xml_md_path": derived_md(
-                row.get("paper_id", ""), DERIVED_MD_DIRS["xml_md_path"]),
+            # 下载验收只登记权威原文及其来源绑定。解析产物必须由
+            # validate_document_processing.py 重验源/Markdown SHA 后回填，
+            # 不得因验收时目录中恰好存在 full.md 就自动信任它。
+            "mineru_md_path": "", "xml_md_path": "",
+            "source_item_id": row.get("item_id", ""),
+            "document_id": "",
+            "source_kind": (
+                "xml" if Path(row.get("pdf_path", "")).suffix.casefold() == ".xml" else "pdf"
+            ),
+            "processed_text_sha256": "", "processing_method": "",
+            "processing_version": "", "processing_accepted_at": "",
+            "section_chunks_path": "", "section_chunks_sha256": "",
+            "section_chunks_count": "", "section_chunks_schema_version": "",
         } for row in success]
 
         if args.dry_run:
@@ -534,7 +959,7 @@ def main() -> int:
         try:
             subprocess.run(
                 [sys.executable, str(HERE / "make_manual_backlog.py"),
-                 args.batch_id, "--root", str(root)],
+                 batch_id, "--root", str(root)],
                 check=True,
             )
         except (OSError, subprocess.CalledProcessError) as exc:
@@ -566,9 +991,9 @@ def main() -> int:
                          if (r["batch_id"], r["item_id"]) not in known_backlog]
         if reaccept:
             paper_kept = [r for r in existing_papers
-                          if r.get("source_batch_id") != args.batch_id]
+                          if r.get("source_batch_id") != batch_id]
             backlog_kept = [r for r in existing_backlog
-                            if r.get("batch_id") != args.batch_id]
+                            if r.get("batch_id") != batch_id]
             final_papers = paper_kept + paper_rows
             final_backlog = backlog_kept + backlog_rows
             n_papers, n_backlog = len(paper_rows), len(backlog_rows)
@@ -576,15 +1001,9 @@ def main() -> int:
             final_papers = existing_papers + fresh_papers
             final_backlog = existing_backlog + fresh_backlog
             n_papers, n_backlog = len(fresh_papers), len(fresh_backlog)
-        # 全局 CSV 不再 append：统一临时文件 + os.replace，避免半行/半批写入。
-        write_csv(root / PAPER_INDEX, PAPER_FIELDS, final_papers)
-        write_csv(root / MANUAL_BACKLOG, BACKLOG_FIELDS, final_backlog)
-
-        record = root / "03_review" / f"{args.batch_id}-acceptance.md"
-        record.parent.mkdir(parents=True, exist_ok=True)
-        tmp_record = record.with_suffix(".md.tmp")
-        tmp_record.write_text(
-            f"# {args.batch_id} 验收记录\n\n"
+        record = root / "03_review" / f"{batch_id}-acceptance.md"
+        record_text = (
+            f"# {batch_id} 验收记录\n\n"
             f"- 验收时间：{now}\n- 验收人角色：协调Agent（accept_batch.py）\n"
             f"- 交付成功：{len(success)} 条（其中身份已证实 "
             f"{sum(1 for r in success if r.get('identity_verified') == 'true')} 条）\n"
@@ -596,9 +1015,8 @@ def main() -> int:
             "## 缺口明细\n\n"
             + ("\n".join(f"- `{r['item_id']}` {r.get('paper_id','')} — {r.get('status','')}"
                          f"：{(r.get('notes','') or '')[:160]}" for r in gaps)
-               or "- 无缺口") + "\n",
-            encoding="utf-8")
-        os.replace(tmp_record, record)
+               or "- 无缺口") + "\n"
+        )
 
         status_now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         note = (f"accept_batch.py {'重新' if reaccept else ''}验收："
@@ -606,30 +1024,46 @@ def main() -> int:
         status_doc["status"] = "ACCEPTED"
         status_doc["updated_at"] = status_now
         status_doc["last_note"] = note
-        tmp_status = status_path.with_suffix(".json.tmp")
-        tmp_status.write_text(
-            json.dumps(status_doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         for row in index:
-            if row.get("batch_id") == args.batch_id:
+            if row.get("batch_id") == batch_id:
                 row["status"] = "ACCEPTED"
                 row["updated_at"] = status_now
                 row["accepted_at"] = status_now
-        tmp_index = index_path.with_suffix(".csv.tmp")
-        with tmp_index.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=index_fields)
-            writer.writeheader()
-            writer.writerows(index)
-        os.replace(tmp_status, status_path)
-        os.replace(tmp_index, index_path)
+
+        # Prepare all bytes and hashes before publishing any authoritative
+        # target. Status files are installed last and a later invocation can
+        # safely replay the exact payloads after a crash between replacements.
+        assert_header_matches(root / PAPER_INDEX, PAPER_FIELDS)
+        assert_header_matches(root / MANUAL_BACKLOG, BACKLOG_FIELDS)
+        backup_once(root / PAPER_INDEX)
+        backup_once(root / MANUAL_BACKLOG)
+        target_payloads = {
+            PAPER_INDEX.as_posix(): render_csv_bytes(PAPER_FIELDS, final_papers),
+            MANUAL_BACKLOG.as_posix(): render_csv_bytes(BACKLOG_FIELDS, final_backlog),
+            f"03_review/{batch_id}-acceptance.md": record_text.encode("utf-8"),
+            f"02_batches/{batch_id}/STATUS.json": (
+                json.dumps(status_doc, ensure_ascii=False, indent=2) + "\n"
+            ).encode("utf-8"),
+            "00_control/BATCH_INDEX.csv": render_csv_bytes(index_fields, index),
+        }
+        try:
+            dependencies = build_acceptance_dependencies(batch, success)
+            prepare_acceptance_transaction(
+                root, batch_id, target_payloads, dependencies)
+            recover_prepared_acceptance(root, batch_id)
+        except (OSError, RuntimeError) as exc:
+            print(f"  ERROR 验收事务写入中断：{exc}")
+            print("验收中断：已准备事务保留，重跑同一命令将自动补齐")
+            return 1
 
     print(f"  已登记索引 {n_papers} 条、待人工 {n_backlog} 条")
     if normalized_results:
         print("  已将验证后的全文路径/类型写回 outputs/download_results.csv")
     print(f"  验收记录：{record.relative_to(root)}")
     if reaccept:
-        print(f"  {args.batch_id} 保持 ACCEPTED（索引已按修正结果替换）")
+        print(f"  {batch_id} 保持 ACCEPTED（索引已按修正结果替换）")
         return 0
-    print(f"  {args.batch_id} → ACCEPTED")
+    print(f"  {batch_id} → ACCEPTED")
     return 0
 
 

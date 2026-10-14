@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 FILES = {
     "01_shared/contracts/LITERATURE_SEARCH_SCHEMA.md": """# 文献检索运行合同
 

@@ -3,7 +3,7 @@
 ## 固定结构
 
 ```text
-/Users/b/Desktop/论文下载/
+${PAPER_DOWNLOAD_WORKSPACE_ROOT}/
 ├── README_总控.md
 ├── 00_control/
 │   ├── WORKSPACE.json

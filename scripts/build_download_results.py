@@ -39,7 +39,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 FIELDS = ["item_id", "paper_id", "status", "title", "doi", "source_url", "pdf_path",
           "supplement_paths", "sha256", "file_bytes", "page_count", "identity_verified",
           "downloaded_at", "notes"]

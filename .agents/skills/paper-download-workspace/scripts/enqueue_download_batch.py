@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 MANIFEST_FIELDS = [
     "item_id", "paper_id", "title", "authors", "year", "journal", "doi",
     "landing_url", "priority", "download_reason", "requested_files",
@@ -130,9 +130,10 @@ def main() -> int:
     manifest_source = Path(args.manifest).expanduser().resolve()
     if not manifest_source.is_file():
         parser.error(f"manifest not found: {manifest_source}")
-    if not (root / "00_control/WORKSPACE.json").exists():
-        initializer = Path(__file__).with_name("init_download_workspace.py")
-        subprocess.run([sys.executable, str(initializer), "--root", str(root)], check=True)
+    # The initializer is idempotent and also reconciles dynamic indexes that
+    # are intentionally absent from a fresh public clone.
+    initializer = Path(__file__).with_name("init_download_workspace.py")
+    subprocess.run([sys.executable, str(initializer), "--root", str(root)], check=True)
 
     source_rows = read_csv(manifest_source)
     if not source_rows:

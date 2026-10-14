@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 REQUIRED_DIRS = ["00_control", "01_shared/contracts", "01_shared/prompts", "02_batches", "03_review", "04_library_index", "05_archive"]
 REQUIRED_FILES = [
     "README_总控.md", "00_control/WORKSPACE.json", "00_control/BATCH_INDEX.csv",

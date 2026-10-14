@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 WORKER_TRANSITIONS = {
     "CLAIMED": {"RUNNING", "BLOCKED", "FAILED"},
     "RUNNING": {"REVIEW", "BLOCKED", "FAILED"},

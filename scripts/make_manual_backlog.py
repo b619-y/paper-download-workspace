@@ -21,7 +21,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 #: 与 03_review/MANUAL_DOWNLOAD_BACKLOG.csv 完全同构（协调侧直接 append）
 TARGET_FIELDS = [
     "batch_id", "item_id", "paper_id", "doi", "title", "status", "reason_code",

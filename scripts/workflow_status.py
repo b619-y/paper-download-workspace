@@ -7,11 +7,21 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
+import sqlite3
+import stat
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+try:  # package import in tests; script import in CLI execution
+    from . import extraction_common, paper_section_chunking as section_chunking, paperqa_luna
+except ImportError:  # pragma: no cover - exercised by direct CLI use
+    import extraction_common
+    import paper_section_chunking as section_chunking
+    import paperqa_luna
 
 
 PRE_DECISIONS = {"download", "exclude", "uncertain"}
@@ -25,7 +35,8 @@ DOWNLOAD_FAILURE = {
     "skipped_duplicate",
 }
 DOWNLOAD_FIELDS = {
-    "item_id", "paper_id", "status", "title", "doi", "pdf_path", "identity_verified",
+    "item_id", "paper_id", "status", "title", "doi", "pdf_path", "sha256",
+    "identity_verified",
 }
 FULLTEXT_FIELDS = [
     "item_id", "paper_id", "title", "doi", "fulltext_path", "fulltext_status",
@@ -37,6 +48,22 @@ TASK_FIELDS = {
     "task_id", "title", "research_question", "inclusion_criteria",
     "exclusion_criteria", "target_evidence", "requires_fulltext_screening",
 }
+OPTIONAL_TASK_FLAGS = {"requires_document_processing", "requires_data_extraction"}
+DOCUMENT_PROCESSING_STATUSES = {
+    "queued", "claimed", "running", "waiting_remote", "retry_wait", "review",
+    "accepted", "blocked", "failed",
+}
+DOCUMENT_PROCESSING_FIELDS = [
+    "job_id", "batch_id", "source_item_id", "paper_id", "document_id", "title", "doi",
+    "source_kind", "source_path", "source_sha256", "processor", "processor_version",
+    "output_dir", "parsed_text_path", "parsed_text_sha256", "sections_path",
+    "sections_sha256", "sections_count", "state_path", "state_sha256",
+    "result_path", "result_sha256", "status", "priority", "attempts", "max_attempts",
+    "available_at", "claimed_by", "claimed_host", "lease_token", "lease_expires_at",
+    "claim_origin", "heartbeat_at", "started_at", "finished_at", "reviewed_by", "reviewed_at",
+    "accepted_at", "error_code", "error_message", "created_at", "updated_at",
+]
+MAX_PAPERQA_MARKER_BYTES = 16 * 1024 * 1024
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -45,6 +72,14 @@ def read_json(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def csv_info(path: Path) -> dict[str, Any]:
@@ -379,6 +414,14 @@ def validate_brief(path: Path, task_id: str) -> tuple[dict[str, Any], list[str]]
             issues.append(f"{field} must be a non-empty list")
     if "requires_fulltext_screening" in brief and not isinstance(brief["requires_fulltext_screening"], bool):
         issues.append("requires_fulltext_screening must be boolean")
+    for field in OPTIONAL_TASK_FLAGS:
+        if field in brief and not isinstance(brief[field], bool):
+            issues.append(f"{field} must be boolean")
+    if brief.get("requires_data_extraction") is True:
+        if brief.get("requires_fulltext_screening") is not True:
+            issues.append("requires_data_extraction=true requires requires_fulltext_screening=true")
+        if brief.get("requires_document_processing") is not True:
+            issues.append("requires_data_extraction=true requires requires_document_processing=true")
     return brief, issues
 
 
@@ -790,6 +833,7 @@ def acceptance_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
             manifest_by_id[item_id] = row
     results_by_id: dict[str, dict[str, str]] = {}
     fulltext_paths: dict[str, str] = {}
+    accepted_sources: dict[str, dict[str, Any]] = {}
     success_count = failure_count = 0
     for number, row in enumerate(info["rows"], 2):
         item_id = row.get("item_id", "").strip()
@@ -840,6 +884,11 @@ def acceptance_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
             ))
             if library_row.get("identity_verified", "").strip().casefold() != "true":
                 issues.append(f"PAPER_INDEX row for {item_id} is not identity_verified=true")
+            indexed_sha = library_row.get("sha256", "").strip().casefold()
+            result_sha = row.get("sha256", "").strip().casefold()
+            indexed_source_item = library_row.get("source_item_id", "").strip()
+            if indexed_source_item and indexed_source_item != item_id:
+                issues.append(f"PAPER_INDEX row for {item_id} has a different source_item_id")
             result_path = resolve_workspace_path(root, row.get("pdf_path", ""))
             library_path = resolve_workspace_path(root, library_row.get("pdf_path", ""))
             if library_path is None or not library_path.is_file():
@@ -849,6 +898,15 @@ def acceptance_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
             elif library_path.stat().st_size <= 0:
                 issues.append(f"successful download result {item_id} persisted PDF/XML full text is empty")
             else:
+                actual_sha = file_sha256(library_path)
+                if not result_sha or result_sha != actual_sha:
+                    issues.append(
+                        f"successful download result {item_id} PDF/XML SHA-256 differs from download_results.csv"
+                    )
+                if not indexed_sha or indexed_sha != actual_sha:
+                    issues.append(
+                        f"successful download result {item_id} PDF/XML SHA-256 differs from PAPER_INDEX"
+                    )
                 if result_path is None:
                     issues.append(
                         f"download result {item_id} does not persist its accepted PDF/XML path"
@@ -856,6 +914,15 @@ def acceptance_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
                 elif result_path != library_path:
                     issues.append(f"download result {item_id} path differs from PAPER_INDEX")
                 fulltext_paths[item_id] = str(library_path)
+                accepted_sources[item_id] = {
+                    "item_id": item_id,
+                    "paper_id": paper_id,
+                    "path": library_path,
+                    "path_text": str(library_path),
+                    "kind": "xml" if library_path.suffix.casefold() == ".xml" else "pdf",
+                    "sha256": actual_sha,
+                    "library_row": library_row,
+                }
         else:
             failure_count += 1
     if success_count and library_info["error"]:
@@ -875,10 +942,322 @@ def acceptance_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
         "failed_or_unavailable": failure_count,
         "_results": results_by_id,
         "_fulltext_paths": fulltext_paths,
+        "_sources": accepted_sources,
     }
 
 
-def queue_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
+def _sqlite_rows(path: Path) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    """Read the authoritative processing queue without creating or mutating it."""
+    issues: list[str] = []
+    try:
+        database = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        database.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        return [], [], [f"cannot open queue.sqlite3 read-only: {exc}"]
+    try:
+        integrity = database.execute("PRAGMA quick_check").fetchone()
+        if not integrity or str(integrity[0]).casefold() != "ok":
+            issues.append("queue.sqlite3 failed SQLite quick_check")
+        table = database.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='jobs'"
+        ).fetchone()
+        if table is None:
+            return [], [], issues + ["queue.sqlite3 has no jobs table"]
+        columns = [str(row[1]) for row in database.execute("PRAGMA table_info(jobs)")]
+        rows = [dict(row) for row in database.execute("SELECT * FROM jobs ORDER BY job_id")]
+        metadata = database.execute(
+            "SELECT value FROM metadata WHERE key='schema_version'"
+        ).fetchone() if database.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='metadata'"
+        ).fetchone() else None
+        if metadata is None or str(metadata[0]) != "3":
+            issues.append("queue.sqlite3 schema_version is missing or unsupported")
+        return columns, rows, issues
+    except sqlite3.Error as exc:
+        return [], [], issues + [f"cannot read queue.sqlite3: {exc}"]
+    finally:
+        database.close()
+
+
+def _json_binding_issues(path: Path, expected: dict[str, str], label: str) -> list[str]:
+    document = read_json(path)
+    if not path.is_file() or not document:
+        return [f"{label} is missing, unreadable, or empty"]
+    issues: list[str] = []
+    for field, value in expected.items():
+        actual = str(document.get(field) or "").strip()
+        if actual != value:
+            issues.append(f"{label} {field} does not match the accepted job")
+    return issues
+
+
+def document_processing_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
+    """Validate the per-document processing queue and every accepted artifact.
+
+    The SQLite database is authoritative.  ``queue.csv`` is required as an
+    auditable projection but can never advance state on its own.
+    """
+    directory = root / "02_batches" / batch["batch_id"] / "outputs/document_processing"
+    database_path = directory / "queue.sqlite3"
+    projection_path = directory / "queue.csv"
+    sources = (batch.get("_acceptance") or {}).get("_sources", {})
+    gate: dict[str, Any] = {
+        "database": rel(database_path, root) if database_path.is_file() else None,
+        "projection": rel(projection_path, root) if projection_path.is_file() else None,
+        "exists": database_path.is_file(), "valid": False, "complete": False,
+        "applicable": len(sources), "rows": 0, "issues": [], "status_counts": {},
+    }
+    # A batch containing only explicit download failures has no document to
+    # parse.  It advances to a fulltext_unavailable screening queue directly.
+    if not sources:
+        gate.update({"valid": True, "complete": True, "skipped_no_fulltext": True})
+        return gate
+    if not database_path.is_file():
+        gate["issues"] = ["document-processing queue.sqlite3 is missing"]
+        return gate
+
+    columns, jobs, issues = _sqlite_rows(database_path)
+    gate["rows"] = len(jobs)
+    missing_columns = [field for field in DOCUMENT_PROCESSING_FIELDS if field not in columns]
+    extra_columns = [field for field in columns if field not in DOCUMENT_PROCESSING_FIELDS]
+    if missing_columns:
+        issues.append("jobs table missing fields: " + ", ".join(missing_columns))
+    if extra_columns:
+        issues.append("jobs table has unexpected fields: " + ", ".join(extra_columns))
+
+    projection = csv_info(projection_path)
+    if projection["error"]:
+        issues.append(f"queue.csv {projection['error']}")
+    elif projection["header"] != DOCUMENT_PROCESSING_FIELDS:
+        issues.append("queue.csv header does not match the document-processing contract")
+    if not projection["error"] and projection["header"] == DOCUMENT_PROCESSING_FIELDS:
+        projected = {row.get("job_id", ""): row for row in projection["rows"]}
+        if len(projected) != len(projection["rows"]) or "" in projected:
+            issues.append("queue.csv job_id values must be non-empty and unique")
+        database_rows = {str(row.get("job_id") or ""): row for row in jobs}
+        if len(database_rows) != len(jobs) or "" in database_rows:
+            issues.append("jobs.job_id values must be non-empty and unique")
+        if set(projected) != set(database_rows):
+            issues.append("queue.csv does not project exactly the jobs table")
+        else:
+            for job_id, db_row in database_rows.items():
+                for field in DOCUMENT_PROCESSING_FIELDS:
+                    db_value = "" if db_row.get(field) is None else str(db_row.get(field))
+                    if projected[job_id].get(field, "") != db_value:
+                        issues.append(f"queue.csv differs from jobs table for {job_id}.{field}")
+                        break
+
+    counts = {status: 0 for status in sorted(DOCUMENT_PROCESSING_STATUSES)}
+    jobs_by_item: dict[str, list[dict[str, Any]]] = {}
+    for number, job in enumerate(jobs, 1):
+        status = str(job.get("status") or "").strip().casefold()
+        if status not in DOCUMENT_PROCESSING_STATUSES:
+            issues.append(f"job row {number} has unknown status {status!r}")
+        else:
+            counts[status] += 1
+        item_id = str(job.get("source_item_id") or "").strip()
+        jobs_by_item.setdefault(item_id, []).append(job)
+    gate["status_counts"] = counts
+    if set(jobs_by_item) != set(sources):
+        issues.append(
+            "document-processing coverage mismatch: "
+            f"missing={sorted(set(sources)-set(jobs_by_item))} "
+            f"extra={sorted(set(jobs_by_item)-set(sources))}"
+        )
+
+    for item_id, source in sources.items():
+        matches = jobs_by_item.get(item_id, [])
+        if len(matches) != 1:
+            if matches:
+                issues.append(f"source item {item_id} maps to multiple processing jobs")
+            continue
+        job = matches[0]
+        label = f"processing job {job.get('job_id') or item_id}"
+        kind = str(job.get("source_kind") or "").strip().casefold()
+        processor = str(job.get("processor") or "").strip()
+        expected_processor = "mineru" if source["kind"] == "pdf" else "xml_to_markdown"
+        if str(job.get("batch_id") or "").strip() != batch["batch_id"]:
+            issues.append(f"{label} batch_id mismatch")
+        if str(job.get("paper_id") or "").strip() != source["paper_id"]:
+            issues.append(f"{label} paper_id mismatch")
+        if kind != source["kind"]:
+            issues.append(f"{label} source_kind mismatch")
+        if processor != expected_processor:
+            issues.append(f"{label} processor must be {expected_processor}")
+        if not str(job.get("processor_version") or "").strip():
+            issues.append(f"{label} has no processor_version")
+        source_path = resolve_workspace_path(root, str(job.get("source_path") or ""))
+        if source_path != source["path"]:
+            issues.append(f"{label} source_path differs from accepted PDF/XML")
+        source_sha = str(job.get("source_sha256") or "").strip().casefold()
+        if source_sha != source["sha256"]:
+            issues.append(f"{label} source_sha256 differs from the current PDF/XML")
+        index = source["library_row"]
+        if index.get("source_item_id", "").strip() != item_id:
+            issues.append(f"PAPER_INDEX row for {item_id} lacks the exact source_item_id binding")
+        if index.get("source_kind", "").strip().casefold() != source["kind"]:
+            issues.append(f"PAPER_INDEX row for {item_id} source_kind mismatch")
+        indexed_sha = index.get("sha256", "").strip().casefold()
+        if indexed_sha != source_sha:
+            issues.append(f"PAPER_INDEX row for {item_id} source SHA mismatch")
+
+        if str(job.get("status") or "").strip().casefold() != "accepted":
+            continue
+        output_path = resolve_workspace_path(root, str(job.get("output_dir") or ""))
+        output_base = "06_mineru" if kind == "pdf" else "07_xml_markdown"
+        expected_output = (
+            root / output_base / "by-sha256" / source_sha[:2] / source_sha
+            / str(job.get("job_id") or "")
+        ).resolve()
+        if output_path != expected_output:
+            issues.append(f"{label} output_dir is not the content-addressed directory")
+        parsed_path = resolve_workspace_path(root, str(job.get("parsed_text_path") or ""))
+        parsed_sha = str(job.get("parsed_text_sha256") or "").strip().casefold()
+        if parsed_path is None or not parsed_path.is_file() or parsed_path.stat().st_size <= 0:
+            issues.append(f"{label} accepted Markdown is missing or empty")
+        elif parsed_path.suffix.casefold() != ".md":
+            issues.append(f"{label} parsed_text_path is not Markdown")
+        elif not parsed_sha or file_sha256(parsed_path) != parsed_sha:
+            issues.append(f"{label} parsed_text_sha256 mismatch")
+        if parsed_path != expected_output / "full.md":
+            issues.append(f"{label} parsed_text_path is not canonical")
+        sections_path = resolve_workspace_path(root, str(job.get("sections_path") or ""))
+        sections_sha = str(job.get("sections_sha256") or "").strip().casefold()
+        sections_count = job.get("sections_count")
+        if (isinstance(sections_count, bool) or not isinstance(sections_count, int)
+                or sections_count <= 0):
+            issues.append(f"{label} sections_count must be a positive integer")
+        if (sections_path is None or not sections_path.is_file()
+                or sections_path.stat().st_size <= 0):
+            issues.append(f"{label} sections_path is missing or empty")
+        elif not sections_sha or file_sha256(sections_path) != sections_sha:
+            issues.append(f"{label} sections_sha256 mismatch")
+        elif parsed_path is not None and parsed_path.is_file() and isinstance(sections_count, int):
+            try:
+                records = section_chunking.validate_sections_jsonl(
+                    sections_path,
+                    parsed_path,
+                    source_sha256=source_sha,
+                    parsed_text_sha256=parsed_sha,
+                    expected_count=sections_count,
+                    paper_id=str(job.get("paper_id") or ""),
+                    source_file=source["path"].name,
+                    source_format=kind,
+                )
+                expected_section_binding = {
+                    "paper_id": str(job.get("paper_id") or ""),
+                    "source_file": source["path"].name,
+                    "source_format": kind,
+                }
+                for number, record in enumerate(records, 1):
+                    mismatch = [
+                        field for field, expected in expected_section_binding.items()
+                        if record.get(field) != expected
+                    ]
+                    if mismatch:
+                        issues.append(
+                            f"{label} section record {number} binding mismatch: {mismatch}")
+                        break
+                canonical = section_chunking.section_records(
+                    parsed_path.read_bytes().decode("utf-8"),
+                    paper_id=expected_section_binding["paper_id"],
+                    source_file=expected_section_binding["source_file"],
+                    source_format=expected_section_binding["source_format"],
+                    source_sha256=source_sha,
+                    parsed_text_sha256=parsed_sha,
+                )
+                if records != canonical:
+                    issues.append(f"{label} sections are not the canonical deterministic projection")
+            except (OSError, ValueError) as exc:
+                issues.append(f"{label} sections validation failed: {exc}")
+        if sections_path != expected_output / "section_chunks.jsonl":
+            issues.append(f"{label} sections_path is not canonical")
+        for path_field, sha_field in (("state_path", "state_sha256"), ("result_path", "result_sha256")):
+            artifact = resolve_workspace_path(root, str(job.get(path_field) or ""))
+            expected_artifact = expected_output / (
+                "state.json" if path_field == "state_path" else "result.json")
+            if artifact != expected_artifact:
+                issues.append(f"{label} {path_field} is not canonical")
+            expected_sha = str(job.get(sha_field) or "").strip().casefold()
+            if artifact is None or not artifact.is_file() or artifact.stat().st_size <= 0:
+                issues.append(f"{label} {path_field} is missing or empty")
+                continue
+            if not expected_sha or file_sha256(artifact) != expected_sha:
+                issues.append(f"{label} {sha_field} mismatch")
+            expected_json = {
+                "job_id": str(job.get("job_id") or "").strip(),
+                "document_id": str(job.get("document_id") or "").strip(),
+                "paper_id": str(job.get("paper_id") or "").strip(),
+                "source_file": source["path"].name,
+                "source_format": kind,
+                "source_sha256": source_sha,
+                "processor": processor,
+                "processor_version": str(job.get("processor_version") or "").strip(),
+                "parsed_text_path": "full.md",
+                "parsed_text_sha256": parsed_sha,
+                "sections_path": "section_chunks.jsonl",
+                "sections_sha256": sections_sha,
+                "sections_count": str(sections_count),
+                "status": "done" if path_field == "state_path" else "succeeded",
+            }
+            if path_field == "result_path":
+                expected_json.update({
+                    "state_path": "state.json",
+                    "state_sha256": str(job.get("state_sha256") or "").strip(),
+                })
+            issues.extend(_json_binding_issues(
+                artifact, expected_json, f"{label} {path_field}",
+            ))
+        if processor == "mineru":
+            accepted_state = read_json(resolve_workspace_path(
+                root, str(job.get("state_path") or "")) or Path("/__missing__"))
+            accepted_result = read_json(resolve_workspace_path(
+                root, str(job.get("result_path") or "")) or Path("/__missing__"))
+            remote_batch_id = str(accepted_state.get("remote_batch_id") or "")
+            if (not remote_batch_id
+                    or accepted_state.get("remote_data_id") != str(job.get("job_id") or "")):
+                issues.append(f"{label} state lacks the exact MinerU remote identity")
+            if (accepted_result.get("remote_batch_id") != remote_batch_id
+                    or accepted_result.get("remote_data_id") != str(job.get("job_id") or "")):
+                issues.append(f"{label} result MinerU remote identity mismatch")
+        derived_field = "mineru_md_path" if source["kind"] == "pdf" else "xml_md_path"
+        indexed_parsed = resolve_workspace_path(root, index.get(derived_field, ""))
+        if parsed_path is None or indexed_parsed != parsed_path:
+            issues.append(f"PAPER_INDEX row for {item_id} {derived_field} mismatch")
+        indexed_sections = resolve_workspace_path(root, index.get("section_chunks_path", ""))
+        if sections_path is None or indexed_sections != sections_path:
+            issues.append(f"PAPER_INDEX row for {item_id} section_chunks_path mismatch")
+        bindings = {
+            "document_id": str(job.get("document_id") or "").strip(),
+            "processed_text_sha256": parsed_sha,
+            "processing_method": processor,
+            "processing_version": str(job.get("processor_version") or "").strip(),
+            "section_chunks_sha256": sections_sha,
+            "section_chunks_count": str(sections_count),
+            "section_chunks_schema_version": section_chunking.SECTION_SCHEMA_VERSION,
+        }
+        for field, expected in bindings.items():
+            if not expected or index.get(field, "").strip() != expected:
+                issues.append(f"PAPER_INDEX row for {item_id} {field} mismatch")
+        if not index.get("processing_accepted_at", "").strip():
+            issues.append(f"PAPER_INDEX row for {item_id} lacks processing_accepted_at")
+        if not str(job.get("accepted_at") or "").strip():
+            issues.append(f"{label} lacks accepted_at")
+
+    gate.update({
+        "valid": not issues,
+        "complete": not issues and bool(jobs) and counts["accepted"] == len(jobs),
+        "issues": issues,
+        "_jobs": jobs,
+        "_accepted_jobs": [
+            job for job in jobs
+            if str(job.get("status") or "").strip().casefold() == "accepted"
+        ],
+    })
+    return gate
+
+
+def queue_gate(root: Path, batch: dict[str, Any], *, require_overall: bool = False) -> dict[str, Any]:
     path = root / "02_batches" / batch["batch_id"] / "outputs/fulltext_screening_queue.csv"
     info = csv_info(path)
     gate: dict[str, Any] = {
@@ -906,6 +1285,7 @@ def queue_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
     queue_ids: set[str] = set()
     pairs: set[tuple[str, str]] = set()
     criteria_by_item: dict[str, set[str]] = {}
+    overall_by_item: dict[str, str] = {}
     pending = unresolved = 0
     for number, row in enumerate(info["rows"], 2):
         item_id = row.get("item_id", "").strip()
@@ -921,6 +1301,10 @@ def queue_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
         if item_id:
             queue_ids.add(item_id)
             criteria_by_item.setdefault(item_id, set()).add(criterion)
+            if criterion == "OVERALL":
+                if item_id in overall_by_item:
+                    issues.append(f"queue item {item_id} has multiple OVERALL rows")
+                overall_by_item[item_id] = decision
         manifest_row = manifest_by_id.get(item_id)
         if manifest_row is not None:
             issues.extend(metadata_mismatches(
@@ -987,8 +1371,690 @@ def queue_gate(root: Path, batch: dict[str, Any]) -> dict[str, Any]:
         issues.append("queue does not apply the same criterion set to every manifest item")
     if batch["_manifest"] and not info["rows"]:
         issues.append("queue has no rows")
-    gate.update({"valid": not issues, "issues": issues, "pending_ready": pending, "unresolved": unresolved})
+    if require_overall:
+        missing_overall = sorted(set(manifest_ids) - set(overall_by_item))
+        if missing_overall:
+            issues.append(f"data-extraction task queue lacks OVERALL rows for {missing_overall}")
+        incomplete_overall = sorted(
+            item_id for item_id, decision in overall_by_item.items()
+            if decision not in {"include", "exclude", "uncertain", "not_assessed"}
+        )
+        if incomplete_overall:
+            issues.append(f"data-extraction task has incomplete OVERALL decisions for {incomplete_overall}")
+    gate.update({
+        "valid": not issues, "issues": issues, "pending_ready": pending,
+        "unresolved": unresolved, "_rows": info["rows"], "_overall": overall_by_item,
+    })
     return gate
+
+
+def extraction_spec_gate(root: Path, task_root: Path, task_id: str) -> dict[str, Any]:
+    path = task_root / "extraction/extraction_spec.json"
+    gate: dict[str, Any] = {
+        "path": rel(path, root) if path.is_file() else None,
+        "exists": path.is_file(), "valid": False, "issues": [],
+        "spec_version": None, "spec_sha256": None,
+    }
+    if not path.is_file():
+        gate["issues"] = ["extraction_spec.json is missing"]
+        return gate
+    try:
+        spec, spec_hash = extraction_common.load_spec(path, task_id)
+    except (OSError, ValueError) as exc:
+        gate["issues"] = [f"extraction spec contract violation: {exc}"]
+        return gate
+    gate.update({
+        "valid": True, "issues": [],
+        "spec_version": str(spec.get("spec_version") or "").strip() or None,
+        "spec_sha256": spec_hash or None, "_spec": spec,
+    })
+    return gate
+
+
+def _expected_extraction_documents(batches: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    expected: dict[tuple[str, str], dict[str, Any]] = {}
+    for batch in batches:
+        processing = batch.get("_processing") or {}
+        overall = (batch.get("queue") or {}).get("_overall", {})
+        for job in processing.get("_accepted_jobs", []):
+            item_id = str(job.get("source_item_id") or "").strip()
+            key = (batch["batch_id"], item_id)
+            expected[key] = {
+                "batch_id": batch["batch_id"], "item_id": item_id,
+                "paper_id": str(job.get("paper_id") or "").strip(),
+                "source_kind": str(job.get("source_kind") or "").strip(),
+                "source_path": str(job.get("source_path") or "").strip(),
+                "source_sha256": str(job.get("source_sha256") or "").strip().casefold(),
+                "parsed_text_path": str(job.get("parsed_text_path") or "").strip(),
+                "parsed_text_sha256": str(job.get("parsed_text_sha256") or "").strip().casefold(),
+                "sections_path": str(job.get("sections_path") or "").strip(),
+                "sections_sha256": str(job.get("sections_sha256") or "").strip().casefold(),
+                "sections_count": job.get("sections_count"),
+                "sections_schema_version": section_chunking.SECTION_SCHEMA_VERSION,
+                "parser": str(job.get("processor") or "").strip(),
+                "parser_version": str(job.get("processor_version") or "").strip(),
+                "fulltext_decision": overall.get(item_id, ""),
+            }
+    return expected
+
+
+def _compare_json_projection(json_jobs: list[dict[str, Any]], csv_path: Path) -> list[str]:
+    info = csv_info(csv_path)
+    if info["error"]:
+        return [f"data_extraction_queue.csv {info['error']}"]
+    issues: list[str] = []
+    if "job_id" not in info["header"]:
+        return ["data_extraction_queue.csv lacks job_id"]
+    projected = {row.get("job_id", ""): row for row in info["rows"]}
+    authoritative = {str(row.get("job_id") or ""): row for row in json_jobs}
+    if "" in projected or len(projected) != len(info["rows"]):
+        issues.append("data_extraction_queue.csv job_id values must be non-empty and unique")
+    if set(projected) != set(authoritative):
+        issues.append("data_extraction_queue.csv does not project exactly the authoritative queue")
+        return issues
+    for job_id, job in authoritative.items():
+        for field in info["header"]:
+            value = job.get(field, "")
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            expected = "" if value is None else str(value)
+            if projected[job_id].get(field, "") != expected:
+                issues.append(f"data_extraction_queue.csv differs for {job_id}.{field}")
+                break
+    return issues
+
+
+def _read_bounded_json_object_nofollow(
+    root: Path, path: Path, *, maximum_bytes: int,
+) -> dict[str, Any]:
+    """Read a workspace JSON object without following any path-component symlink."""
+    root = root.resolve()
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError as exc:
+        raise ValueError("JSON marker escapes the workspace") from exc
+    if not parts:
+        raise ValueError("JSON marker path is invalid")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(root, directory_flags)
+    try:
+        for component in parts[:-1]:
+            next_descriptor = os.open(
+                component, directory_flags | nofollow, dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        file_descriptor = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=descriptor)
+        try:
+            metadata = os.fstat(file_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("JSON marker is not a regular file")
+            if metadata.st_size > maximum_bytes:
+                raise ValueError(f"JSON marker exceeds {maximum_bytes} bytes")
+            chunks: list[bytes] = []
+            remaining = maximum_bytes + 1
+            while remaining:
+                block = os.read(file_descriptor, min(1 << 20, remaining))
+                if not block:
+                    break
+                chunks.append(block)
+                remaining -= len(block)
+            raw = b"".join(chunks)
+            if len(raw) > maximum_bytes:
+                raise ValueError(f"JSON marker exceeds {maximum_bytes} bytes")
+        finally:
+            os.close(file_descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"JSON marker is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON marker root must be an object")
+    return value
+
+
+def _paperqa_result_gate(root: Path, task_id: str, job: dict[str, Any],
+                         spec: dict[str, Any]) -> tuple[bool, list[str], str | None]:
+    job_id = str(job.get("job_id") or "").strip()
+    if not extraction_common.ATTEMPT_ID_RE.fullmatch(job_id):
+        return False, [f"PaperQA result has unsafe job_id {job_id!r}"], None
+    path = root.resolve() / "runtime/results" / task_id / "paperqa" / f"{job_id}.json"
+    if not path.exists() and not path.is_symlink():
+        return False, [], None
+    try:
+        document = _read_bounded_json_object_nofollow(
+            root, path, maximum_bytes=MAX_PAPERQA_MARKER_BYTES,
+        )
+        paperqa_luna.validate_paperqa_marker(
+            document, expected_job=job, revalidate_files=True,
+        )
+    except (OSError, ValueError) as exc:
+        return False, [f"PaperQA result {job_id} is invalid: {exc}"], rel(path, root)
+    return True, [], rel(path, root)
+
+
+def extraction_queue_gate(root: Path, task_root: Path, task_id: str,
+                          spec_gate: dict[str, Any], batches: list[dict[str, Any]]) -> dict[str, Any]:
+    directory = task_root / "extraction"
+    path = directory / "data_extraction_queue.json"
+    projection = directory / "data_extraction_queue.csv"
+    gate: dict[str, Any] = {
+        "path": rel(path, root) if path.is_file() else None,
+        "projection": rel(projection, root) if projection.is_file() else None,
+        "exists": path.is_file(), "valid": False, "issues": [], "rows": 0,
+        "status_counts": {}, "paperqa_missing": [], "paperqa_invalid": [],
+        "pending_receipts": [],
+    }
+    if not path.is_file():
+        gate["issues"] = ["data_extraction_queue.json is missing"]
+        return gate
+    try:
+        queue = extraction_common.load_queue(
+            path,
+            expected_task_id=task_id,
+            expected_spec_version=str(spec_gate.get("spec_version") or ""),
+            expected_spec_sha256=str(spec_gate.get("spec_sha256") or ""),
+        )
+    except (OSError, ValueError) as exc:
+        gate["issues"] = [f"data extraction queue contract violation: {exc}"]
+        return gate
+    issues: list[str] = []
+    jobs = queue["jobs"]
+    gate["rows"] = len(jobs)
+    issues.extend(_compare_json_projection(jobs, projection))
+
+    expected = _expected_extraction_documents(batches)
+    by_source: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    counts: dict[str, int] = {
+        status: 0 for status in (
+            "queued", "claimed", "running", "review", "accepted",
+            "retry_wait", "blocked", "failed", "skipped",
+        )
+    }
+    seen_job_ids: set[str] = set()
+    paperqa_missing: list[str] = []
+    paperqa_invalid: list[str] = []
+    paperqa_paths: dict[str, str] = {}
+    pending_receipts: list[str] = []
+    for number, job in enumerate(jobs, 1):
+        job_id = str(job.get("job_id") or "").strip()
+        if not job_id or job_id in seen_job_ids:
+            issues.append(f"data extraction job row {number} has blank or duplicate job_id")
+        seen_job_ids.add(job_id)
+        status = str(job.get("status") or "").strip().casefold()
+        if status not in counts:
+            issues.append(f"data extraction job {job_id or number} has unknown status {status!r}")
+        else:
+            counts[status] += 1
+        history = job.get("receipt_history", [])
+        history_by_attempt = {
+            str(entry.get("attempt_id") or ""): entry
+            for entry in history if isinstance(entry, dict)
+        } if isinstance(history, list) else {}
+        receipt_dir = root / "runtime/results" / task_id / "data_extraction" / job_id / "receipts"
+        if receipt_dir.is_dir():
+            for receipt in sorted(receipt_dir.glob("*.json")):
+                entry = history_by_attempt.get(receipt.stem)
+                if entry is None:
+                    pending_receipts.append(rel(receipt, root) or str(receipt))
+                elif str(entry.get("receipt_sha256") or "") != file_sha256(receipt):
+                    issues.append(f"data extraction job {job_id} receipt history hash mismatch")
+        for attempt_id, entry in history_by_attempt.items():
+            receipt = receipt_dir / f"{attempt_id}.json"
+            if not receipt.is_file():
+                issues.append(f"data extraction job {job_id} receipt history file is missing")
+        key = (
+            str(job.get("batch_id") or "").strip(),
+            str(job.get("item_id") or job.get("source_item_id") or "").strip(),
+        )
+        by_source.setdefault(key, []).append(job)
+        expected_doc = expected.get(key)
+        if expected_doc is None:
+            continue
+        comparisons = {
+            "paper_id": expected_doc["paper_id"],
+            "source_kind": expected_doc["source_kind"],
+            "source_sha256": expected_doc["source_sha256"],
+            "parsed_text_sha256": expected_doc["parsed_text_sha256"],
+            "sections_sha256": expected_doc["sections_sha256"],
+            "sections_schema_version": expected_doc["sections_schema_version"],
+            "parser": expected_doc["parser"],
+            "parser_version": expected_doc["parser_version"],
+            "spec_version": str(spec_gate.get("spec_version") or ""),
+            "spec_sha256": str(spec_gate.get("spec_sha256") or ""),
+            "task_id": task_id,
+        }
+        for field, value in comparisons.items():
+            if str(job.get(field) or "").strip() != value:
+                issues.append(f"data extraction job {job_id} {field} binding mismatch")
+        if job.get("sections_count") != expected_doc["sections_count"]:
+            issues.append(f"data extraction job {job_id} sections_count binding mismatch")
+        for field in ("source_path", "parsed_text_path", "sections_path"):
+            job_path = resolve_workspace_path(root, str(job.get(field) or ""))
+            expected_path = resolve_workspace_path(root, expected_doc[field])
+            if job_path != expected_path:
+                issues.append(f"data extraction job {job_id} {field} mismatch")
+            elif job_path is None or not job_path.is_file() or job_path.stat().st_size <= 0:
+                issues.append(f"data extraction job {job_id} {field} is missing or empty")
+            else:
+                expected_sha = expected_doc[
+                    {"source_path": "source_sha256", "parsed_text_path": "parsed_text_sha256",
+                     "sections_path": "sections_sha256"}[field]
+                ]
+                if file_sha256(job_path) != expected_sha:
+                    issues.append(f"data extraction job {job_id} {field} content hash mismatch")
+        allowed = set((spec_gate.get("_spec") or {}).get("source_scope", {}).get(
+            "fulltext_decisions", ["include", "uncertain"],
+        ))
+        should_skip = expected_doc["fulltext_decision"] not in allowed
+        if should_skip != (status == "skipped"):
+            issues.append(
+                f"data extraction job {job_id} status does not honor fulltext decision "
+                f"{expected_doc['fulltext_decision']!r}"
+            )
+        if status != "skipped":
+            paperqa_valid, paperqa_issues, paperqa_path = _paperqa_result_gate(
+                root, task_id, job, spec_gate.get("_spec") or {},
+            )
+            if paperqa_path is None:
+                paperqa_missing.append(job_id)
+            elif not paperqa_valid:
+                paperqa_invalid.append(job_id)
+                gate.setdefault("_paperqa_issues", []).extend(paperqa_issues)
+            else:
+                paperqa_paths[job_id] = paperqa_path
+    if set(by_source) != set(expected):
+        issues.append(
+            "data extraction coverage mismatch: "
+            f"missing={sorted(set(expected)-set(by_source))} "
+            f"extra={sorted(set(by_source)-set(expected))}"
+        )
+    for key, matches in by_source.items():
+        if len(matches) != 1:
+            issues.append(f"data extraction source {key} maps to multiple jobs")
+    gate.update({
+        "valid": not issues, "issues": issues, "status_counts": counts,
+        "paperqa_missing": paperqa_missing, "paperqa_invalid": paperqa_invalid,
+        "paperqa_issue_details": list(gate.get("_paperqa_issues", [])),
+        "paperqa_results": paperqa_paths, "_queue": queue, "_jobs": jobs,
+        "_expected": expected, "pending_receipts": pending_receipts,
+    })
+    return gate
+
+
+def extraction_review_gate(root: Path, task_root: Path, task_id: str,
+                           spec_gate: dict[str, Any], queue_gate_result: dict[str, Any]) -> dict[str, Any]:
+    review_path = task_root / "extraction/review_queue.csv"
+    review_info = csv_info(review_path)
+    issues: list[str] = []
+    accepted_jobs = [
+        job for job in queue_gate_result.get("_jobs", [])
+        if str(job.get("status") or "").strip().casefold() == "accepted"
+    ]
+    if accepted_jobs and review_info["error"]:
+        issues.append(f"review_queue.csv {review_info['error']}")
+    rows_by_job: dict[str, list[dict[str, str]]] = {}
+    if not review_info["error"]:
+        for row in review_info["rows"]:
+            rows_by_job.setdefault(row.get("job_id", "").strip(), []).append(row)
+    result_paths: dict[str, str] = {}
+    accepted_bindings: list[dict[str, Any]] = []
+    for job in accepted_jobs:
+        job_id = str(job.get("job_id") or "").strip()
+        directory = root / "runtime/results" / task_id / "data_extraction" / job_id
+        result_path = directory / "result.json"
+        validation_path = directory / "validation.json"
+        acceptance_path = directory / "ACCEPTANCE.json"
+        result_doc = read_json(result_path)
+        validation_doc = read_json(validation_path)
+        acceptance_doc = read_json(acceptance_path)
+        bindings = {
+            "task_id": task_id, "job_id": job_id,
+            "paper_id": str(job.get("paper_id") or "").strip(),
+            "source_sha256": str(job.get("source_sha256") or "").strip(),
+            "parsed_text_sha256": str(job.get("parsed_text_sha256") or "").strip(),
+            "spec_version": str(spec_gate.get("spec_version") or "").strip(),
+            "spec_sha256": str(spec_gate.get("spec_sha256") or "").strip(),
+        }
+        attempt_id = str(job.get("attempt_id") or "")
+        run_id = str(job.get("run_id") or "")
+        source_path = resolve_workspace_path(root, str(job.get("source_path") or ""))
+        parsed_path = resolve_workspace_path(root, str(job.get("parsed_text_path") or ""))
+        if (source_path is None or not source_path.is_file()
+                or file_sha256(source_path) != bindings["source_sha256"]):
+            issues.append(f"accepted extraction job {job_id} source is missing or changed")
+        if (parsed_path is None or not parsed_path.is_file()
+                or file_sha256(parsed_path) != bindings["parsed_text_sha256"]):
+            issues.append(f"accepted extraction job {job_id} parsed text is missing or changed")
+        sections_sha = str(job.get("sections_sha256") or "")
+        sections_count = job.get("sections_count", 0)
+        sections_schema = str(job.get("sections_schema_version") or "")
+        if sections_sha:
+            sections_path = resolve_workspace_path(root, str(job.get("sections_path") or ""))
+            if (sections_path is None or not sections_path.is_file()
+                    or file_sha256(sections_path) != sections_sha):
+                issues.append(f"accepted extraction job {job_id} section sidecar is missing or changed")
+            elif parsed_path is not None and parsed_path.is_file():
+                try:
+                    section_chunking.validate_sections_jsonl(
+                        sections_path, parsed_path,
+                        source_sha256=bindings["source_sha256"],
+                        parsed_text_sha256=bindings["parsed_text_sha256"],
+                        expected_count=sections_count if isinstance(sections_count, int) else None,
+                        paper_id=bindings["paper_id"],
+                        source_file=source_path.name if source_path is not None else None,
+                        source_format=str(job.get("source_kind") or ""),
+                    )
+                except (OSError, ValueError) as exc:
+                    issues.append(f"accepted extraction job {job_id} section sidecar invalid: {exc}")
+        result_sha = file_sha256(result_path) if result_path.is_file() else ""
+        validation_sha = file_sha256(validation_path) if validation_path.is_file() else ""
+        receipt_path = resolve_workspace_path(root, str(job.get("receipt_path") or ""))
+        receipt_sha = str(job.get("receipt_sha256") or "")
+        if (receipt_path is None or not receipt_path.is_file()
+                or not receipt_sha or file_sha256(receipt_path) != receipt_sha):
+            issues.append(f"accepted extraction job {job_id} receipt is missing or changed")
+        if not result_doc:
+            issues.append(f"accepted extraction job {job_id} lacks result.json")
+        else:
+            for field, expected in bindings.items():
+                if str(result_doc.get(field) or "").strip() != expected:
+                    issues.append(f"result.json {job_id} {field} binding mismatch")
+            for field, expected in {
+                "attempt_id": attempt_id, "run_id": run_id,
+                "sections_sha256": sections_sha, "sections_count": sections_count,
+                "sections_schema_version": sections_schema,
+            }.items():
+                if result_doc.get(field) != expected:
+                    issues.append(f"result.json {job_id} {field} binding mismatch")
+            if result_doc.get("candidate_only") is not True:
+                issues.append(f"result.json {job_id} is not candidate_only=true")
+            if str(result_doc.get("review_status") or "").strip() != "candidate":
+                issues.append(f"result.json {job_id} review_status is not candidate")
+            if result_doc.get("absence_claim") is not False:
+                issues.append(f"result.json {job_id} makes an unsupported absence claim")
+        if validation_doc.get("valid") is not True:
+            issues.append(f"accepted extraction job {job_id} lacks valid validation.json")
+        for field in ("job_id", "source_sha256", "parsed_text_sha256", "spec_sha256"):
+            if field in validation_doc and str(validation_doc.get(field) or "").strip() != bindings[field]:
+                issues.append(f"validation.json {job_id} {field} binding mismatch")
+        for field, expected in {
+            "task_id": task_id, "job_id": job_id, "attempt_id": attempt_id,
+            "run_id": run_id, "source_sha256": bindings["source_sha256"],
+            "parsed_text_sha256": bindings["parsed_text_sha256"],
+            "sections_sha256": sections_sha, "sections_count": sections_count,
+            "sections_schema_version": sections_schema,
+            "spec_sha256": bindings["spec_sha256"], "result_sha256": result_sha,
+        }.items():
+            if validation_doc.get(field) != expected:
+                issues.append(f"validation.json {job_id} {field} binding mismatch")
+        if str(acceptance_doc.get("status") or "").strip().casefold() != "accepted":
+            issues.append(f"accepted extraction job {job_id} lacks accepted ACCEPTANCE.json")
+        for field in ("job_id", "source_sha256", "parsed_text_sha256", "spec_sha256"):
+            if str(acceptance_doc.get(field) or "").strip() != bindings[field]:
+                issues.append(f"ACCEPTANCE.json {job_id} {field} binding mismatch")
+        marker_checks = {
+            "acceptance_version": "2.0", "task_id": task_id, "job_id": job_id,
+            "attempt_id": attempt_id, "run_id": run_id,
+            "paper_id": bindings["paper_id"],
+            "source_sha256": bindings["source_sha256"],
+            "parsed_text_sha256": bindings["parsed_text_sha256"],
+            "sections_sha256": sections_sha, "sections_count": sections_count,
+            "sections_schema_version": sections_schema,
+            "spec_sha256": bindings["spec_sha256"], "result_sha256": result_sha,
+            "validation_sha256": validation_sha, "receipt_sha256": receipt_sha,
+        }
+        for field, expected in marker_checks.items():
+            if acceptance_doc.get(field) != expected:
+                issues.append(f"ACCEPTANCE.json {job_id} {field} binding mismatch")
+        for field in ("accepted_record_ids", "rejected_record_ids"):
+            if not isinstance(acceptance_doc.get(field), list):
+                issues.append(f"ACCEPTANCE.json {job_id} {field} must be an array")
+        if not str(acceptance_doc.get("accepted_by") or "").strip() or not str(
+            acceptance_doc.get("accepted_at") or ""
+        ).strip():
+            issues.append(f"ACCEPTANCE.json {job_id} lacks accepted_by/accepted_at")
+        review_rows = rows_by_job.get(job_id, [])
+        if not review_rows:
+            issues.append(f"accepted extraction job {job_id} has no human review row")
+        declared_review_sha = str(acceptance_doc.get("review_rows_sha256") or "").strip()
+        actual_review_sha = manifest_key(review_rows) if review_rows else ""
+        if not declared_review_sha or declared_review_sha != actual_review_sha:
+            issues.append(f"ACCEPTANCE.json {job_id} review_rows_sha256 mismatch")
+        for number, row in enumerate(review_rows, 1):
+            decision = row.get("review_decision", "").strip().casefold()
+            if decision not in {"accept", "reject"}:
+                issues.append(f"review row {job_id}/{number} lacks accept/reject decision")
+            if not row.get("reviewer", "").strip() or not row.get("reviewed_at", "").strip():
+                issues.append(f"review row {job_id}/{number} lacks reviewer/reviewed_at")
+            if decision == "accept" and row.get("source_verified", "").strip().casefold() != "true":
+                issues.append(f"accepted review row {job_id}/{number} is not source_verified=true")
+        accepted_ids = sorted(
+            row.get("record_id", "") for row in review_rows
+            if row.get("review_decision", "").strip().casefold() == "accept")
+        rejected_ids = sorted(
+            row.get("record_id", "") for row in review_rows
+            if row.get("review_decision", "").strip().casefold() == "reject")
+        if acceptance_doc.get("accepted_record_ids") != accepted_ids:
+            issues.append(f"ACCEPTANCE.json {job_id} accepted_record_ids mismatch")
+        if acceptance_doc.get("rejected_record_ids") != rejected_ids:
+            issues.append(f"ACCEPTANCE.json {job_id} rejected_record_ids mismatch")
+        accepted_bindings.append({
+            "job_id": job_id, "attempt_id": attempt_id, "run_id": run_id,
+            "source_sha256": bindings["source_sha256"],
+            "parsed_text_sha256": bindings["parsed_text_sha256"],
+            "sections_sha256": sections_sha, "sections_count": sections_count,
+            "sections_schema_version": sections_schema,
+            "spec_sha256": bindings["spec_sha256"], "result_sha256": result_sha,
+            "validation_sha256": validation_sha,
+            "review_rows_sha256": actual_review_sha,
+            "acceptance_sha256": file_sha256(acceptance_path) if acceptance_path.is_file() else "",
+            "receipt_sha256": receipt_sha,
+        })
+        result_paths[job_id] = rel(result_path, root) or str(result_path)
+    accepted_bindings.sort(key=lambda row: str(row.get("job_id") or ""))
+    queue_gate_result["_accepted_job_bindings"] = accepted_bindings
+    return {
+        "valid": not issues, "issues": issues,
+        "review_queue": rel(review_path, root) if review_path.is_file() else None,
+        "accepted_jobs": len(accepted_jobs), "result_paths": result_paths,
+        "job_bindings_sha256": manifest_key(accepted_bindings),
+    }
+
+
+def extraction_delivery_gate(root: Path, task_root: Path, task_id: str,
+                             spec_gate: dict[str, Any], queue_gate_result: dict[str, Any]) -> dict[str, Any]:
+    directory = task_root / "extraction/delivery"
+    manifest_path = directory / "manifest.json"
+    acceptance_path = directory / "ACCEPTANCE.json"
+    required = {
+        "records.json", "records.csv", "evidence.csv", "extraction.sqlite3",
+        "datapackage.json",
+    }
+    gate: dict[str, Any] = {
+        "path": rel(directory, root) if directory.is_dir() else None,
+        "exists": manifest_path.is_file() or acceptance_path.is_file(),
+        "valid": False, "issues": [],
+    }
+    if not manifest_path.is_file() or not acceptance_path.is_file():
+        gate["issues"] = ["delivery manifest.json and/or ACCEPTANCE.json is missing"]
+        return gate
+    manifest = read_json(manifest_path)
+    acceptance = read_json(acceptance_path)
+    records_doc = read_json(directory / "records.json")
+    issues: list[str] = []
+    if manifest.get("manifest_version") != "2.0":
+        issues.append("unsupported delivery manifest version")
+    if acceptance.get("acceptance_version") != "2.0":
+        issues.append("unsupported delivery acceptance version")
+    bindings = {
+        "task_id": task_id,
+        "spec_version": str(spec_gate.get("spec_version") or ""),
+        "spec_sha256": str(spec_gate.get("spec_sha256") or ""),
+    }
+    for field, expected in bindings.items():
+        if str(manifest.get(field) or "").strip() != expected:
+            issues.append(f"delivery manifest {field} binding mismatch")
+        if str(acceptance.get(field) or "").strip() != expected:
+            issues.append(f"delivery ACCEPTANCE {field} binding mismatch")
+    accepted_ids = sorted(
+        str(job.get("job_id") or "").strip()
+        for job in queue_gate_result.get("_jobs", [])
+        if str(job.get("status") or "").strip().casefold() == "accepted"
+    )
+    manifest_ids = sorted(str(value) for value in manifest.get("accepted_job_ids", [])) \
+        if isinstance(manifest.get("accepted_job_ids"), list) else []
+    if manifest_ids != accepted_ids:
+        issues.append("delivery manifest accepted_job_ids mismatch")
+    acceptance_ids = sorted(str(value) for value in acceptance.get("accepted_job_ids", [])) \
+        if isinstance(acceptance.get("accepted_job_ids"), list) else []
+    if acceptance_ids != accepted_ids:
+        issues.append("delivery ACCEPTANCE accepted_job_ids mismatch")
+    expected_job_bindings = queue_gate_result.get("_accepted_job_bindings", [])
+    if not isinstance(expected_job_bindings, list):
+        expected_job_bindings = []
+    expected_job_bindings_sha = manifest_key(expected_job_bindings)
+    if manifest.get("job_bindings") != expected_job_bindings:
+        issues.append("delivery manifest job_bindings do not match accepted job snapshots")
+    if str(manifest.get("job_bindings_sha256") or "") != expected_job_bindings_sha:
+        issues.append("delivery manifest job_bindings_sha256 mismatch")
+    if records_doc.get("job_bindings") != expected_job_bindings:
+        issues.append("delivery records.json job_bindings do not match accepted job snapshots")
+    if str(records_doc.get("job_bindings_sha256") or "") != expected_job_bindings_sha:
+        issues.append("delivery records.json job_bindings_sha256 mismatch")
+    if str(acceptance.get("job_bindings_sha256") or "") != expected_job_bindings_sha:
+        issues.append("delivery ACCEPTANCE job_bindings_sha256 mismatch")
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        issues.append("delivery manifest files must be an array")
+        files = []
+    declared_names: set[str] = set()
+    for number, entry in enumerate(files, 1):
+        if not isinstance(entry, dict):
+            issues.append(f"delivery manifest file entry {number} is invalid")
+            continue
+        path_text = str(entry.get("path") or "").strip()
+        artifact = resolve_workspace_path(root, path_text)
+        if artifact is None or not inside(artifact, directory) or not artifact.is_file():
+            issues.append(f"delivery manifest file entry {number} path is missing or escapes delivery/")
+            continue
+        declared_names.add(artifact.name)
+        actual_sha = file_sha256(artifact)
+        if str(entry.get("sha256") or "").strip() != actual_sha:
+            issues.append(f"delivery file {artifact.name} sha256 mismatch")
+        try:
+            declared_bytes = int(entry.get("bytes"))
+        except (TypeError, ValueError):
+            declared_bytes = -1
+        if declared_bytes != artifact.stat().st_size:
+            issues.append(f"delivery file {artifact.name} byte count mismatch")
+    if required - declared_names:
+        issues.append(f"delivery manifest omits required files {sorted(required-declared_names)}")
+    if str(acceptance.get("status") or "").strip().casefold() != "accepted":
+        issues.append("delivery ACCEPTANCE status is not accepted")
+    if not str(acceptance.get("accepted_by") or "").strip() or not str(
+        acceptance.get("accepted_at") or ""
+    ).strip():
+        issues.append("delivery ACCEPTANCE lacks accepted_by/accepted_at")
+    declared_manifest_sha = str(acceptance.get("manifest_sha256") or "").strip()
+    if not declared_manifest_sha or declared_manifest_sha != file_sha256(manifest_path):
+        issues.append("delivery ACCEPTANCE manifest_sha256 mismatch")
+    gate.update({"valid": not issues, "issues": issues})
+    return gate
+
+
+def route_extraction(root: Path, evidence: dict[str, Any], task_root: Path,
+                     task_id: str, batches: list[dict[str, Any]]) -> dict[str, Any]:
+    spec = extraction_spec_gate(root, task_root, task_id)
+    evidence["extraction_spec"] = public_gate(spec)
+    if not spec["exists"] or not spec["valid"]:
+        return result(
+            root, "STAGE_4_DEFINE_EXTRACTION",
+            "The task requires data extraction but has no valid, versioned extraction contract.",
+            f"Create and validate runtime/tasks/{task_id}/extraction/extraction_spec.json before running any model.",
+            evidence,
+        )
+    queue = extraction_queue_gate(root, task_root, task_id, spec, batches)
+    evidence["data_extraction_queue"] = public_gate(queue)
+    if not queue["exists"]:
+        return result(
+            root, "STAGE_4_CREATE_EXTRACTION_QUEUE",
+            "The extraction contract is valid but no task-level extraction queue exists.",
+            f"Run scripts/make_data_extraction_queue.py --root . --task-id {task_id}.", evidence,
+        )
+    if not queue["valid"]:
+        return result(
+            root, "STAGE_5_DATA_EXTRACTION_INVALID",
+            "The extraction queue/projection or its immutable source, parser, screening, or spec bindings are invalid.",
+            "Repair the existing task queue and stale bindings; do not silently recreate accepted results.", evidence,
+        )
+    if queue.get("pending_receipts"):
+        return result(
+            root, "STAGE_5_MERGE_EXTRACTION_RECEIPTS",
+            "One or more immutable worker completion receipts have not been merged into the coordinator queue.",
+            f"Run scripts/merge_extraction_receipts.py --root . --task-id {task_id} before retrying, reviewing, or delivering extraction results.",
+            evidence,
+        )
+    counts = queue["status_counts"]
+    if queue["paperqa_missing"] or queue["paperqa_invalid"]:
+        return result(
+            root, "STAGE_4_EVIDENCE_LOCATION",
+            "One or more eligible extraction jobs lack a current PaperQA evidence-location result.",
+            "Run PaperQA2 for each listed job using its fixed question and exact source/parsed/spec hashes; no_evidence remains a reviewable locator result, not an absence conclusion.",
+            evidence,
+        )
+    if counts.get("blocked"):
+        return result(
+            root, "STAGE_5_DATA_EXTRACTION_BLOCKED",
+            "At least one structured-extraction job requires a human or environment fix.",
+            "Resolve the recorded blocker and retry the same job without changing its immutable bindings.", evidence,
+        )
+    if counts.get("failed"):
+        return result(
+            root, "STAGE_5_DATA_EXTRACTION_FAILED",
+            "At least one structured-extraction job failed permanently or exhausted retries.",
+            "Diagnose the recorded failure and explicitly retry only after the cause is corrected.", evidence,
+        )
+    if any(counts.get(status) for status in ("queued", "claimed", "running", "retry_wait")):
+        return result(
+            root, "STAGE_5_DATA_EXTRACTION",
+            "Eligible papers still need resumable full-Markdown structured extraction.",
+            f"Run scripts/luna_extract_data.py --root . --task-id {task_id} --worker <unique-id> for the remaining jobs.",
+            evidence,
+        )
+    if counts.get("review"):
+        return result(
+            root, "STAGE_6_EXTRACTION_REVIEW",
+            "Candidate extraction results await field-level human verification against the original PDF/XML.",
+            "Validate results, fill review_queue.csv, and accept or reject every candidate and every no-record job.",
+            evidence,
+        )
+    review = extraction_review_gate(root, task_root, task_id, spec, queue)
+    evidence["extraction_review"] = public_gate(review)
+    if not review["valid"]:
+        return result(
+            root, "STAGE_6_EXTRACTION_REVIEW",
+            "Queue states claim acceptance but job results, validation, human review, or acceptance bindings are incomplete.",
+            "Repair and complete the job-level review/acceptance records before building delivery files.", evidence,
+        )
+    delivery = extraction_delivery_gate(root, task_root, task_id, spec, queue)
+    evidence["extraction_delivery"] = public_gate(delivery)
+    if not delivery["valid"]:
+        return result(
+            root, "STAGE_7_EXTRACTION_DELIVERY",
+            "All extraction jobs are resolved, but the hashed delivery package is missing or invalid.",
+            "Build and coordinator-accept the CSV/JSON/SQLite/Frictionless delivery package from accepted jobs only.",
+            evidence,
+        )
+    return result(
+        root, "COMPLETE_EXTRACTION",
+        "All eligible jobs, human review records, source bindings, and delivery hashes are accepted.",
+        "Use the accepted delivery package; retain original PDF/XML as the evidence authority.", evidence,
+    )
 
 
 def manifest_config_issues(manifest: dict[str, Any], query: dict[str, Any]) -> list[str]:
@@ -1147,7 +2213,10 @@ def public_gate(gate: dict[str, Any]) -> dict[str, Any]:
 
 
 def route_batches(root: Path, evidence: dict[str, Any], batches: list[dict[str, Any]],
-                  requires_fulltext: bool, explicit_batch: str | None) -> dict[str, Any] | None:
+                  requires_fulltext: bool, explicit_batch: str | None,
+                  requires_document_processing: bool = False,
+                  requires_data_extraction: bool = False,
+                  task_root: Path | None = None, task_id: str | None = None) -> dict[str, Any] | None:
     if not batches:
         return None
     for batch in batches:
@@ -1159,8 +2228,16 @@ def route_batches(root: Path, evidence: dict[str, Any], batches: list[dict[str, 
         if not acceptance["valid"]:
             batch["issues"].append("ACCEPTED batch lacks valid download/acceptance evidence")
             continue
-        if requires_fulltext:
-            batch["queue"] = queue_gate(root, batch)
+        processing_complete = True
+        if requires_document_processing:
+            processing = document_processing_gate(root, batch)
+            batch["_processing"] = processing
+            batch["document_processing"] = public_gate(processing)
+            processing_complete = bool(processing.get("complete"))
+        if requires_fulltext and processing_complete:
+            batch["queue"] = queue_gate(
+                root, batch, require_overall=requires_data_extraction,
+            )
     evidence["batches"] = [public_batch(batch) for batch in batches]
 
     actionable: list[dict[str, Any]] = []
@@ -1168,6 +2245,14 @@ def route_batches(root: Path, evidence: dict[str, Any], batches: list[dict[str, 
         status = batch["status"]
         if batch["issues"] or status in {"READY", "CLAIMED", "RUNNING", "REVIEW", "BLOCKED", "FAILED"}:
             actionable.append(batch)
+        elif status == "ACCEPTED" and requires_document_processing:
+            processing = batch.get("_processing", {})
+            if not processing.get("complete"):
+                actionable.append(batch)
+            elif requires_fulltext:
+                queue = batch.get("queue", {})
+                if not queue.get("valid") or queue.get("pending_ready"):
+                    actionable.append(batch)
         elif status == "ACCEPTED" and requires_fulltext:
             queue = batch.get("queue", {})
             if not queue.get("valid") or queue.get("pending_ready"):
@@ -1210,6 +2295,55 @@ def route_batches(root: Path, evidence: dict[str, Any], batches: list[dict[str, 
                 root, "STAGE_2_DOWNLOAD_REVIEW", "The batch awaits coordinator acceptance.",
                 "Validate coverage, identities, hashes, pages and failures, then accept or return it.", evidence,
             )
+        if requires_document_processing:
+            processing = batch.get("_processing", {})
+            if not processing.get("complete"):
+                counts = processing.get("status_counts", {})
+                if not processing.get("exists"):
+                    return result(
+                        root, "STAGE_3_CREATE_DOCUMENT_PROCESSING_QUEUE",
+                        "The accepted batch requires document processing and has no authoritative queue.",
+                        f"Run scripts/make_document_processing_queue.py {batch['batch_id']} --root .", evidence,
+                    )
+                if processing.get("issues"):
+                    return result(
+                        root, "STAGE_3_DOCUMENT_PROCESSING_INVALID",
+                        "The document-processing database, projection, artifact, SHA, or PAPER_INDEX binding is invalid.",
+                        "Repair the recorded queue/artifact evidence; do not recreate accepted work or advance screening.",
+                        evidence,
+                    )
+                if counts.get("blocked"):
+                    return result(
+                        root, "STAGE_3_DOCUMENT_PROCESSING_BLOCKED",
+                        "At least one document-processing job needs credentials or a human action.",
+                        "Resolve each recorded blocker, then use the coordinator retry command on the same job.", evidence,
+                    )
+                if counts.get("failed"):
+                    return result(
+                        root, "STAGE_3_DOCUMENT_PROCESSING_FAILED",
+                        "At least one document-processing job exhausted retries or failed permanently.",
+                        "Diagnose the recorded failure and explicitly retry the same job only when justified.", evidence,
+                    )
+                if counts.get("review"):
+                    return result(
+                        root, "STAGE_3_DOCUMENT_PROCESSING_REVIEW",
+                        "A worker delivered parsed text that awaits coordinator validation.",
+                        f"Run scripts/accept_document_processing.py {batch['batch_id']} --root . --actor-role coordinator.",
+                        evidence,
+                    )
+                if counts.get("retry_wait"):
+                    return result(
+                        root, "STAGE_3_DOCUMENT_PROCESSING_RECOVERY",
+                        "A document-processing job is waiting for an authorized retry or backoff expiry.",
+                        f"After its available_at time, continue scripts/document_processing_worker.py {batch['batch_id']} --root . with a unique --worker-id.",
+                        evidence,
+                    )
+                return result(
+                    root, "STAGE_3_DOCUMENT_PROCESSING",
+                    "The document-processing queue still has queued, claimed, running, or remote-waiting jobs.",
+                    f"Continue scripts/document_processing_worker.py {batch['batch_id']} --root . with a unique --worker-id.",
+                    evidence,
+                )
         queue = batch.get("queue", {})
         if not queue.get("exists"):
             return result(
@@ -1229,6 +2363,8 @@ def route_batches(root: Path, evidence: dict[str, Any], batches: list[dict[str, 
             "Screen the remaining ready rows and record verifiable evidence and reviewer attribution.", evidence,
         )
     if requires_fulltext:
+        if requires_data_extraction and not explicit_batch and task_root is not None and task_id:
+            return route_extraction(root, evidence, task_root, task_id, batches)
         return result(
             root, "COMPLETE_OR_HUMAN_REVIEW",
             "Current-run accepted batches have valid queues with no ready row pending.",
@@ -1266,7 +2402,11 @@ def inspect(root: Path, task_id: str | None = None,
             "Create or repair its task brief before query design.", evidence,
         )
     requires_fulltext = brief.get("requires_fulltext_screening") is True
+    requires_document_processing = brief.get("requires_document_processing") is True
+    requires_data_extraction = brief.get("requires_data_extraction") is True
     evidence["requires_fulltext_screening"] = requires_fulltext
+    evidence["requires_document_processing"] = requires_document_processing
+    evidence["requires_data_extraction"] = requires_data_extraction
     query = query_gate(task_root, root)
     evidence["query"] = public_gate(query)
     selected_pointer = selection.get("active_task")
@@ -1293,7 +2433,11 @@ def inspect(root: Path, task_id: str | None = None,
             "Select or consolidate one query directory before continuing.", evidence,
         )
     if not query["valid"]:
-        routed = route_batches(root, evidence, batches, requires_fulltext, batch_id)
+        routed = route_batches(
+            root, evidence, batches, requires_fulltext, batch_id,
+            requires_document_processing, requires_data_extraction,
+            task_root, selected_id,
+        )
         if routed is not None:
             return routed
         return result(
@@ -1304,7 +2448,11 @@ def inspect(root: Path, task_id: str | None = None,
     screening_rows = search.get("_screening_rows", [])
     evidence["search"] = public_gate(search)
     if batch_id:
-        routed = route_batches(root, evidence, batches, requires_fulltext, batch_id)
+        routed = route_batches(
+            root, evidence, batches, requires_fulltext, batch_id,
+            requires_document_processing, requires_data_extraction,
+            task_root, selected_id,
+        )
         if routed is not None:
             return routed
     latest_run_key = search.get("run_key")
@@ -1319,11 +2467,16 @@ def inspect(root: Path, task_id: str | None = None,
     # is designed.  Completed direct batches do not mask a newer search run.
     priority_batches = current_batches + [
         batch for batch in direct_batches
-        if batch["status"] != "ACCEPTED" or batch["issues"] or not search["exists"]
+        if (batch["status"] != "ACCEPTED" or batch["issues"] or not search["exists"]
+            or requires_data_extraction)
     ]
     priority_batches = list({batch["batch_id"]: batch for batch in priority_batches}.values())
     if priority_batches:
-        routed = route_batches(root, evidence, priority_batches, requires_fulltext, batch_id)
+        routed = route_batches(
+            root, evidence, priority_batches, requires_fulltext, batch_id,
+            requires_document_processing, requires_data_extraction,
+            task_root, selected_id,
+        )
         if routed is not None:
             return routed
     if not search["exists"]:

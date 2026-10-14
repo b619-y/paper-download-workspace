@@ -1,6 +1,6 @@
 interface:
   display_name: "论文筛选与下载工作区"
-  short_description: "先按题名摘要初筛，再下载全文并按证据复筛"
-  default_prompt: "Use $paper-download-workspace to screen candidate papers by search query, title, and abstract; enqueue the papers that need full text; download and verify them; then screen the verified full text with quoted evidence and page or section locations."
+  short_description: "多库检索、题摘初筛、全文下载解析、证据复筛与可选数据提取"
+  default_prompt: "使用 $paper-download-workspace 完成多数据库检索、题名摘要初筛、全文下载与解析、可追溯证据复筛，并按需开展结构化数据提取。"
 policy:
   allow_implicit_invocation: true

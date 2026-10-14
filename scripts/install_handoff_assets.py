@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 
-DEFAULT_ROOT = Path("/Users/b/Desktop/论文下载")
+DEFAULT_ROOT = Path.cwd()
 FILES = {
     "01_shared/contracts/SCREENING_DOWNLOAD_HANDOFF.md": """# 检索筛选到下载批次的交接合同
 
