@@ -138,6 +138,14 @@ LangGraph 的 checkpoint 保证图状态可恢复，不保证外部副作用 exa
 
 不得用双向文件同步方式合并 SQLite checkpoint/WAL/锁文件，也不得因某主机能运行模型就推定已允许传输论文内容。
 
+## 故障恢复
+
+当权威状态进入 `INVALID`、`BLOCKED`、`FAILED`、`ERROR`、`INCOMPLETE` 或
+`RECOVERY` 阶段时，总控可先调用唯一的 `recovery_agent`。它通过
+`scripts/workflow_recovery.py` 最多执行三个白名单动作，并在每个动作后重新读取
+`workflow_status.py`。白名单只包含从已验证权威 SQLite/JSON 队列重建 CSV 投影；
+中断验收、过期 lease 和 receipt 合并交回既有流程。它不能替用户回复 interrupt，也不能改变研究判断、授权、重试预算或人工验收。详见[故障恢复智能体](故障恢复智能体.md)。
+
 ## Git 与安全
 
 checkpoint、WAL、锁文件、interrupt 回复、API 响应、筛选标注、PDF/XML 和任何任务运行数据都必须位于被 Git 忽略的 `runtime/` 或现有动态目录。公开仓库只提交代码、合同、文档、空模板和可选依赖范围。

@@ -44,6 +44,15 @@ python3 -m venv .venv
 
 关键边界不因接入 LangGraph 而变化：`workflow_status.py`、SQLite/JSONL 队列、工件哈希、receipt/manifest 和人工验收才是业务权威。checkpoint 只保存编排游标和工件引用，位于 Git 忽略的 `runtime/orchestration/` 中。
 
+## 自动故障恢复
+
+工作区提供一个 `recovery_agent`，只自动重建已经验证的权威 SQLite/JSON
+队列的损坏或缺失 CSV 投影，不修改权威队列和业务状态。每次最多三个动作，
+同一投影目标跨重启最多自动尝试一次；中断验收、过期 lease、receipt 合并、
+检索策略、筛选结论、授权、哈希/身份冲突、下载、模型调用和验收仍交给既有流程或人工。
+命令与边界见
+[故障恢复智能体](docs/故障恢复智能体.md)。
+
 ## 推荐流程
 
 1. **检索式**：生成并实测 recall / balanced / precision_pilot 三套策略。

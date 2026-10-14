@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import accept_extraction_job
 import build_extraction_delivery
+import extraction_common
 import luna_extract_data
 import make_data_extraction_queue
 import make_extraction_review_queue
@@ -109,6 +111,83 @@ def model_response(_prompt: str, _codex: str, _model: str) -> dict:
         {"field_id": "sample_id", "value": "A", "unit": None, "value_semantics": "identifier", "evidence": [{"exact_quote": "Sample A", "locator": "Results"}]},
         {"field_id": "outcome", "value": 5.0, "unit": "mg/L", "value_semantics": "reported", "evidence": [{"exact_quote": "5 mg/L", "locator": "Results"}]},
     ]}], "no_relevant_data": False, "notes": ""}
+
+
+def test_projection_export_loads_authority_inside_queue_lock(tmp_path: Path) -> None:
+    task_id, _ = setup_task(tmp_path)
+    paths = task_paths(tmp_path, task_id)
+    paths["queue_csv"].unlink()
+    events: list[str] = []
+    real_lock = extraction_common.PinnedDirectory.locked_file
+    real_read = extraction_common.PinnedDirectory.read_json
+
+    @contextmanager
+    def observed_lock(directory, name: str):
+        with real_lock(directory, name):
+            events.append("locked")
+            yield
+            events.append("unlocked")
+
+    def observed_read(directory, name: str, **kwargs):
+        assert events == ["locked"]
+        events.append(f"read:{name}")
+        value = real_read(directory, name, **kwargs)
+        events.pop()
+        return value
+
+    with patch.object(
+        extraction_common.PinnedDirectory, "locked_file", observed_lock,
+    ), patch.object(
+        extraction_common.PinnedDirectory, "read_json", observed_read,
+    ):
+        extraction_common.export_queue_projection(paths)
+
+    assert events == ["locked", "unlocked"]
+    assert paths["queue_csv"].is_file()
+
+
+def test_projection_export_rejects_concurrent_ancestor_symlink_swap(
+    tmp_path: Path,
+) -> None:
+    task_id, _ = setup_task(tmp_path)
+    paths = task_paths(tmp_path, task_id)
+    extraction = paths["extraction"]
+    moved = extraction.with_name("extraction.old")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-extraction"
+    outside.mkdir()
+    outside_csv = outside / "data_extraction_queue.csv"
+    outside_csv.write_text("outside-sentinel\n", encoding="utf-8")
+    real_read = extraction_common.PinnedDirectory.read_json
+    swapped = False
+
+    def swap_after_queue_read(directory, name: str, **kwargs):
+        nonlocal swapped
+        value = real_read(directory, name, **kwargs)
+        if name == "data_extraction_queue.json" and not swapped:
+            extraction.rename(moved)
+            extraction.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return value
+
+    with patch.object(
+        extraction_common.PinnedDirectory, "read_json", swap_after_queue_read,
+    ), pytest.raises((OSError, ValueError)):
+        extraction_common.export_queue_projection(paths)
+
+    assert outside_csv.read_text(encoding="utf-8") == "outside-sentinel\n"
+
+
+def test_projection_export_rejects_dangling_lock_symlink(tmp_path: Path) -> None:
+    task_id, _ = setup_task(tmp_path)
+    paths = task_paths(tmp_path, task_id)
+    paths["queue_lock"].unlink(missing_ok=True)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-lock"
+    paths["queue_lock"].symlink_to(outside)
+
+    with pytest.raises(OSError):
+        extraction_common.export_queue_projection(paths)
+
+    assert not outside.exists()
 
 
 def test_end_to_end_candidate_review_accept_and_delivery(tmp_path: Path) -> None:

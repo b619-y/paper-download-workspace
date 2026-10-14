@@ -48,6 +48,19 @@ LangGraph 薄总控，只用于持久化“当前在哪一步、正在等哪个�
 若 `.venv/bin/python` 不存在，先按 `docs/LangGraph总控.md` 安装可选依赖；不要改用
 内存 checkpointer。仅运行基线状态检查时仍可直接使用 `python3 scripts/workflow_status.py`。
 
+出现异常时只使用一个 `recovery_agent`。先读 `docs/故障恢复智能体.md` 并只读诊断：
+
+```bash
+python3 scripts/workflow_recovery.py status --root . --task-id <task_id>
+```
+
+只有输出明确列出 `safe_actions` 时，才运行
+`python3 scripts/workflow_recovery.py run --root . --task-id <task_id> --policy safe --max-actions 3`。
+它只能在权威 SQLite/JSON 队列和其不可变绑定通过校验、且唯一问题是 CSV 投影时重建该投影；
+不得自动处理中断验收、过期 lease 或提取 receipt 合并，这些只诊断并交回既有 coordinator/worker/人工流程。
+也不得自动改变检索/筛选判断、授权、下载批次状态、重试预算、hash/identity、外部模型调用或人工验收。
+同一投影目标跨重启最多自动尝试一次；路径绑定变化、修复后故障仍存在或出现更严重阶段时立即转人工。没有白名单动作时报告并停止。
+
 初始化命令可重复运行：公开 clone 中只有索引/决策示例，它会在本机创建被 Git 忽略的
 真实 `BATCH_INDEX.csv`、`PAPER_INDEX.csv`、`DECISIONS.md`，并安全追加兼容旧表头
 缺少的列；不会把真实运行数据变成仓库模板。

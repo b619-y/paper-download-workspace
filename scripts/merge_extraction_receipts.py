@@ -19,7 +19,7 @@ from extraction_common import (
     atomic_write_text, attempt_id_for, attempt_result_path, completion_receipt_path,
     document_identity, exclusive_lock,
     get_job, load_queue, parse_time, result_path, sha256_file, task_paths,
-    utc_now, write_queue,
+    secure_workspace_path, utc_now, write_queue,
 )
 from validate_extraction_result import write_validation
 
@@ -139,15 +139,42 @@ def _history_entry(receipt: dict[str, Any], digest: str) -> dict[str, Any]:
 
 
 def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
+    root = paths["root"]
+    safe = dict(paths)
+    safe["task"] = secure_workspace_path(
+        root, paths["task"], within=root / "runtime/tasks"
+    )
+    for key in ("extraction", "spec", "queue", "queue_csv", "queue_lock"):
+        safe[key] = secure_workspace_path(root, paths[key], within=safe["task"])
+    safe["results"] = secure_workspace_path(
+        root, paths["results"], within=root / "runtime/results"
+    )
+    safe["extraction_results"] = secure_workspace_path(
+        root, paths["extraction_results"], within=safe["results"]
+    )
+    receipt_path = secure_workspace_path(
+        root, receipt_path, within=safe["extraction_results"], must_exist=True,
+    )
     initial_hash = sha256_file(receipt_path)
     receipt = read_receipt(receipt_path)
     job_id = str(receipt["job_id"])
-    canonical = completion_receipt_path(paths, job_id, str(receipt["attempt_id"])).resolve()
-    if receipt_path.resolve() != canonical:
+    canonical = secure_workspace_path(
+        root,
+        completion_receipt_path(safe, job_id, str(receipt["attempt_id"])),
+        within=safe["extraction_results"],
+        must_exist=True,
+    )
+    if receipt_path != canonical:
         raise ValueError(f"receipt is outside canonical attempt directory: {receipt_path}")
 
-    with exclusive_lock(paths["queue_lock"]):
-        queue = load_queue(paths["queue"], expected_task_id=paths["task"].name)
+    with exclusive_lock(safe["queue_lock"]):
+        # Recheck all mutable control paths after acquiring the queue lock.
+        for key in ("spec", "queue", "queue_csv", "queue_lock"):
+            safe[key] = secure_workspace_path(root, safe[key], within=safe["task"])
+        receipt_path = secure_workspace_path(
+            root, receipt_path, within=safe["extraction_results"], must_exist=True,
+        )
+        queue = load_queue(safe["queue"], expected_task_id=safe["task"].name)
         if queue["task_id"] != receipt["task_id"]:
             raise ValueError("completion receipt task_id does not match selected queue")
         job = get_job(queue, job_id)
@@ -164,10 +191,14 @@ def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
             if prior != expected_history:
                 raise ValueError(f"immutable receipt conflicts with applied history: {job_id}")
             if receipt["status"] == "review":
-                immutable_result = attempt_result_path(
-                    paths, job_id, str(receipt["attempt_id"])
+                immutable_result = secure_workspace_path(
+                    root,
+                    attempt_result_path(safe, job_id, str(receipt["attempt_id"])),
+                    within=safe["extraction_results"], must_exist=True,
                 )
-                result = result_path(paths, job_id)
+                result = secure_workspace_path(
+                    root, result_path(safe, job_id), within=safe["extraction_results"]
+                )
                 if (not immutable_result.is_file()
                         or sha256_file(immutable_result) != receipt["result_sha256"]):
                     raise ValueError(f"already-merged review result is stale: {job_id}")
@@ -208,8 +239,10 @@ def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
             "attempt_count": receipt["attempt_count"],
         }
         if target == "review":
-            immutable_result = attempt_result_path(
-                paths, job_id, str(receipt["attempt_id"])
+            immutable_result = secure_workspace_path(
+                root,
+                attempt_result_path(safe, job_id, str(receipt["attempt_id"])),
+                within=safe["extraction_results"], must_exist=True,
             )
             expected_hash = str(receipt["result_sha256"])
             if not immutable_result.is_file() or sha256_file(immutable_result) != expected_hash:
@@ -219,7 +252,7 @@ def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
                 raise ValueError(f"review receipt model mismatch: {job_id}")
             from validate_extraction_result import validate
             errors, _, _ = validate(
-                paths, job_id, require_source=True, attempt_binding=attempt_binding,
+                safe, job_id, require_source=True, attempt_binding=attempt_binding,
                 result_file=immutable_result,
             )
             if errors:
@@ -227,14 +260,17 @@ def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
             if sha256_file(immutable_result) != expected_hash or sha256_file(receipt_path) != initial_hash:
                 raise ValueError(f"remote result/receipt changed during coordinator validation: {job_id}")
             atomic_write_text(
-                result_path(paths, job_id), immutable_result.read_text(encoding="utf-8")
+                secure_workspace_path(
+                    root, result_path(safe, job_id), within=safe["extraction_results"]
+                ),
+                immutable_result.read_text(encoding="utf-8"),
             )
             valid, errors = write_validation(
-                paths, job_id, require_source=True, attempt_binding=attempt_binding
+                safe, job_id, require_source=True, attempt_binding=attempt_binding
             )
             if not valid:
                 raise ValueError(f"promoted result failed coordinator validation: {'; '.join(errors)}")
-            if sha256_file(result_path(paths, job_id)) != expected_hash:
+            if sha256_file(result_path(safe, job_id)) != expected_hash:
                 raise ValueError(f"promoted canonical result hash mismatch: {job_id}")
             job["status"] = "review"
             job["error_code"] = ""
@@ -251,7 +287,7 @@ def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
         job["lease_token"] = ""
         job["lease_expires_at"] = ""
         job["heartbeat_at"] = ""
-        job["receipt_path"] = str(receipt_path.relative_to(paths["root"]))
+        job["receipt_path"] = str(receipt_path.relative_to(safe["root"]))
         job["receipt_sha256"] = initial_hash
         history.append(expected_history)
         job["updated_at"] = utc_now()
@@ -262,13 +298,16 @@ def merge_one(paths: dict[str, Path], receipt_path: Path) -> str:
                 or sha256_file(receipt_path) != initial_hash):
             raise ValueError(f"completion receipt changed before queue commit: {job_id}")
         if target == "review":
-            canonical_result = result_path(paths, job_id)
+            canonical_result = secure_workspace_path(
+                root, result_path(safe, job_id), within=safe["extraction_results"],
+                must_exist=True,
+            )
             if (immutable_result.is_symlink() or not immutable_result.is_file()
                     or sha256_file(immutable_result) != expected_hash
                     or canonical_result.is_symlink() or not canonical_result.is_file()
                     or sha256_file(canonical_result) != expected_hash):
                 raise ValueError(f"review result changed before queue commit: {job_id}")
-        write_queue(paths, queue)
+        write_queue(safe, queue)
         return target
 
 

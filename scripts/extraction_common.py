@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import unicodedata
 from contextlib import contextmanager
@@ -37,6 +38,7 @@ RESULT_VERSION = "1.0"
 MAX_CHUNK_CHARS = 100_000
 MAX_CHUNK_OVERLAP = 20_000
 MAX_SPEC_BYTES = 1_048_576
+MAX_QUEUE_BYTES = 268_435_456
 MAX_SPEC_FIELDS = 500
 MAX_SPEC_TEXT = 20_000
 MAX_SPEC_ENUM_VALUES = 1_000
@@ -116,6 +118,257 @@ def exclusive_lock(path: Path) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def secure_workspace_path(
+    root: Path,
+    path: Path,
+    *,
+    within: Path | None = None,
+    must_exist: bool = False,
+) -> Path:
+    """Resolve a workspace path while rejecting workspace-owned symlinks.
+
+    ``Path.resolve()`` alone is not sufficient for control-plane paths: if a
+    task or results directory is itself a symlink, resolving both the child and
+    its alleged parent can make an escape look valid.  Derive the lexical path
+    below the workspace first, reject every existing symlink component, then
+    verify the canonical result.  The two-root handling preserves macOS
+    aliases such as ``/var -> /private/var`` above the workspace boundary.
+    """
+    lexical_root = root.expanduser().absolute()
+    canonical_root = lexical_root.resolve()
+    raw = path.expanduser()
+    lexical_candidate = raw if raw.is_absolute() else lexical_root / raw
+    try:
+        relative = lexical_candidate.relative_to(lexical_root)
+    except ValueError:
+        try:
+            relative = lexical_candidate.relative_to(canonical_root)
+        except ValueError as exc:
+            raise ValueError(f"path escapes the workspace: {lexical_candidate}") from exc
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"path contains an unsafe component: {lexical_candidate}")
+    candidate = canonical_root / relative
+    current = canonical_root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"workspace path must not contain symlinks: {current}")
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(canonical_root)
+    except ValueError as exc:
+        raise ValueError(f"path escapes the workspace: {candidate}") from exc
+    if within is not None:
+        parent = secure_workspace_path(root, within)
+        try:
+            resolved.relative_to(parent)
+        except ValueError as exc:
+            raise ValueError(f"path escapes its canonical directory: {candidate}") from exc
+    if must_exist and not resolved.exists():
+        raise ValueError(f"required workspace path is missing: {relative}")
+    return resolved
+
+
+class PinnedDirectory:
+    """Descriptor-relative directory I/O for recovery control paths.
+
+    A normal ``Path`` becomes unsafe if an ancestor is renamed and replaced by
+    a symlink between validation and use.  This helper opens each component
+    with ``O_NOFOLLOW`` and keeps the final directory descriptor pinned.  All
+    recovery reads, locks and atomic writes can then be relative to that
+    descriptor, so a later pathname swap is never followed.
+    """
+
+    def __init__(self, root: Path, relative: Path | str, *, create: bool = False):
+        self.root = root.expanduser().resolve()
+        raw = Path(relative)
+        if raw.is_absolute():
+            try:
+                raw = raw.relative_to(self.root)
+            except ValueError as exc:
+                raise ValueError(f"pinned directory escapes workspace: {relative}") from exc
+        if not raw.parts or any(part in {"", ".", ".."} for part in raw.parts):
+            raise ValueError(f"invalid pinned directory: {relative}")
+        self.relative = raw
+        self.fd = self._open_chain(create=create)
+
+    @staticmethod
+    def _directory_flags() -> int:
+        return (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+
+    def _open_chain(self, *, create: bool) -> int:
+        current = os.open(self.root, self._directory_flags())
+        try:
+            for part in self.relative.parts:
+                if create:
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=current)
+                    except FileExistsError:
+                        pass
+                child = os.open(part, self._directory_flags(), dir_fd=current)
+                os.close(current)
+                current = child
+            return current
+        except BaseException:
+            os.close(current)
+            raise
+
+    @staticmethod
+    def _identity(fd: int) -> tuple[int, int]:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("pinned path is not a directory")
+        return info.st_dev, info.st_ino
+
+    def assert_bound(self) -> None:
+        """Require the current lexical path to still name this directory."""
+        fresh = self._open_chain(create=False)
+        try:
+            if self._identity(fresh) != self._identity(self.fd):
+                raise ValueError(f"pinned directory binding changed: {self.relative}")
+        finally:
+            os.close(fresh)
+
+    @staticmethod
+    def _name(value: str) -> str:
+        if not value or Path(value).name != value or value in {".", ".."}:
+            raise ValueError(f"invalid descriptor-relative filename: {value!r}")
+        return value
+
+    def open_regular(self, name: str, flags: int, mode: int = 0o600) -> int:
+        name = self._name(name)
+        descriptor = os.open(
+            name,
+            flags
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            mode,
+            dir_fd=self.fd,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            os.close(descriptor)
+            raise ValueError(f"pinned file must be a single-link regular file: {name}")
+        return descriptor
+
+    def read_bytes(self, name: str, *, maximum_bytes: int) -> bytes:
+        self.assert_bound()
+        descriptor = self.open_regular(name, os.O_RDONLY)
+        try:
+            size = os.fstat(descriptor).st_size
+            if size > maximum_bytes:
+                raise ValueError(f"pinned file exceeds {maximum_bytes} bytes: {name}")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(1 << 20, maximum_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise ValueError(f"pinned file exceeds {maximum_bytes} bytes: {name}")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    def read_json(self, name: str, *, maximum_bytes: int) -> dict[str, Any]:
+        try:
+            value = json.loads(
+                self.read_bytes(name, maximum_bytes=maximum_bytes).decode("utf-8-sig")
+            )
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"pinned JSON is invalid: {name}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"pinned JSON root must be an object: {name}")
+        return value
+
+    @contextmanager
+    def locked_file(self, name: str) -> Iterator[int]:
+        self.assert_bound()
+        descriptor = self.open_regular(name, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            self.assert_bound()
+            yield descriptor
+            self.assert_bound()
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def mkdir(self, name: str) -> None:
+        name = self._name(name)
+        self.assert_bound()
+        try:
+            os.mkdir(name, 0o700, dir_fd=self.fd)
+        except FileExistsError:
+            child = os.open(name, self._directory_flags(), dir_fd=self.fd)
+            os.close(child)
+
+    def atomic_write_text(self, name: str, value: str) -> None:
+        name = self._name(name)
+        temporary = f".{name}.recovery-{os.getpid()}-{os.urandom(8).hex()}"
+        descriptor: int | None = None
+        try:
+            descriptor = self.open_regular(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            )
+            payload = value.encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            self.assert_bound()
+            os.replace(
+                temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd,
+            )
+            os.fsync(self.fd)
+            self.assert_bound()
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=self.fd)
+            except FileNotFoundError:
+                pass
+
+    def append_line(self, name: str, value: str) -> None:
+        self.assert_bound()
+        descriptor = self.open_regular(
+            name, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600,
+        )
+        try:
+            payload = value.encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+            self.assert_bound()
+        finally:
+            os.close(descriptor)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> "PinnedDirectory":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -212,8 +465,9 @@ def chunk_document(text: str, limit: int, overlap: int) -> list[dict[str, Any]]:
     return chunk_markdown(text, limit=limit, overlap=overlap)
 
 
-def load_spec(path: Path, task_id: str | None = None) -> tuple[dict[str, Any], str]:
-    spec = read_json(path)
+def _validate_spec_value(
+    spec: dict[str, Any], task_id: str | None = None,
+) -> tuple[dict[str, Any], str]:
     if len(json.dumps(spec, ensure_ascii=False).encode("utf-8")) > MAX_SPEC_BYTES:
         raise ValueError(f"extraction spec exceeds {MAX_SPEC_BYTES} bytes")
     allowed = {
@@ -355,6 +609,10 @@ def load_spec(path: Path, task_id: str | None = None) -> tuple[dict[str, Any], s
     if chunk_overlap > chunk_chars // 2:
         raise ValueError("model.chunk_overlap must not exceed half of model.chunk_chars")
     return spec, sha256_json(spec)
+
+
+def load_spec(path: Path, task_id: str | None = None) -> tuple[dict[str, Any], str]:
+    return _validate_spec_value(read_json(path), task_id)
 
 
 def paperqa_question_for(spec: dict[str, Any]) -> str:
@@ -626,13 +884,11 @@ QUEUE_CSV_FIELDS = [
 ]
 
 
-def write_queue(paths: dict[str, Path], queue: dict[str, Any]) -> None:
-    queue["updated_at"] = utc_now()
-    # Apply the exact same top-level, immutable-binding, question, job-id and
-    # runtime-state validation used on reads before either projection changes.
-    spec, spec_sha = load_spec(paths["spec"], paths["task"].name)
+def _validated_queue_projection_values(
+    task_id: str, queue: dict[str, Any], spec: dict[str, Any], spec_sha: str,
+) -> str:
     _validate_queue_value(
-        queue, expected_task_id=paths["task"].name,
+        queue, expected_task_id=task_id,
         expected_spec_version=str(spec["spec_version"]),
         expected_spec_sha256=spec_sha,
     )
@@ -644,7 +900,6 @@ def write_queue(paths: dict[str, Path], queue: dict[str, Any]) -> None:
             raise ValueError(
                 f"queue job PaperQA question differs from current spec: {job.get('job_id')}"
             )
-    atomic_write_json(paths["queue"], queue)
     rows = []
     for job in queue["jobs"]:
         rows.append({key: job.get(key, "") for key in QUEUE_CSV_FIELDS})
@@ -653,7 +908,54 @@ def write_queue(paths: dict[str, Path], queue: dict[str, Any]) -> None:
     writer = csv.DictWriter(stream, fieldnames=QUEUE_CSV_FIELDS)
     writer.writeheader()
     writer.writerows(rows)
-    atomic_write_text(paths["queue_csv"], stream.getvalue())
+    return stream.getvalue()
+
+
+def _validated_queue_projection(paths: dict[str, Path], queue: dict[str, Any]) -> str:
+    # Apply the exact same top-level, immutable-binding, question, job-id and
+    # runtime-state validation used on reads before either projection changes.
+    spec, spec_sha = load_spec(paths["spec"], paths["task"].name)
+    return _validated_queue_projection_values(
+        paths["task"].name, queue, spec, spec_sha,
+    )
+
+
+def export_queue_projection(paths: dict[str, Path]) -> None:
+    """Rebuild CSV from locked JSON using descriptor-relative, nofollow I/O."""
+    root = paths["root"]
+    task_id = ensure_task_id(paths["task"].name)
+    relative = Path("runtime/tasks") / task_id / "extraction"
+    with PinnedDirectory(root, relative) as directory:
+        # Every queue writer uses this lock.  Loading inside it prevents a stale
+        # recovery snapshot from overwriting the projection of a newer queue.
+        with directory.locked_file(".data_extraction_queue.lock"):
+            spec, spec_sha = _validate_spec_value(
+                directory.read_json(
+                    "extraction_spec.json", maximum_bytes=MAX_SPEC_BYTES,
+                ),
+                task_id,
+            )
+            current = _validate_queue_value(
+                directory.read_json(
+                    "data_extraction_queue.json", maximum_bytes=MAX_QUEUE_BYTES,
+                ),
+                expected_task_id=task_id,
+                expected_spec_version=str(spec["spec_version"]),
+                expected_spec_sha256=spec_sha,
+            )
+            directory.atomic_write_text(
+                "data_extraction_queue.csv",
+                _validated_queue_projection_values(
+                    task_id, current, spec, spec_sha,
+                ),
+            )
+
+
+def write_queue(paths: dict[str, Path], queue: dict[str, Any]) -> None:
+    queue["updated_at"] = utc_now()
+    projection = _validated_queue_projection(paths, queue)
+    atomic_write_json(paths["queue"], queue)
+    atomic_write_text(paths["queue_csv"], projection)
 
 
 def get_job(queue: dict[str, Any], job_id: str) -> dict[str, Any]:

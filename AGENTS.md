@@ -32,6 +32,17 @@ LangGraph 只是一层可恢复的编排控制面，不替代上述强制入口�
 - 普通 `StateGraph` 不会自动跨主机调度。Mac/capg/capg2 之间仍使用已有队列、授权同步和不可变回执；checkpoint 不得双向同步或由 Worker 改写。
 - checkpoint 与其 SQLite/WAL/锁文件属于 `runtime/` 运行数据，不得提交 Git。
 
+## 故障恢复智能体
+
+总控遇到 `INVALID`、`BLOCKED`、`FAILED`、`ERROR`、`INCOMPLETE` 或 `RECOVERY`
+阶段时，先调用 `recovery_agent` 做只读诊断；只有
+`scripts/workflow_recovery.py status` 明确列出的 `safe_actions` 才可自动执行。
+`run --policy safe --max-actions 3` 是硬边界，每个动作后必须重新读取权威状态。
+自动白名单只包含“有效权威 SQLite/JSON 队列 → CSV 投影”的重建，不改变权威队列或业务状态。
+中断验收、过期 lease 和 receipt 合并只诊断并交回既有流程。同一投影目标跨重启最多自动尝试一次；
+复发、后置条件未消失或路径绑定变化时必须 fail closed。
+修复白名单、审计日志和必须人工处理的边界见 [故障恢复智能体](docs/故障恢复智能体.md)。
+
 ## 总原则
 
 - 先读 `README_总控.md`、`00_control/POLICIES.md` 和相关合同。
@@ -52,6 +63,7 @@ LangGraph 只是一层可恢复的编排控制面，不替代上述强制入口�
 
 - `workflow_coordinator_agent`：先读取真实文件状态，判断断点并只调度下一阶段。
 - `langgraph_coordinator_agent`：可选的持久化薄总控，用于检索式→多源检索→题名/摘要筛选→`READY` 批次的中断恢复和并行编排；不是新的业务状态源。
+- `recovery_agent`：只处理白名单内的确定性故障恢复；不修改研究判断、授权、身份/哈希绑定或人工验收。
 - `query_agent`：拆解问题，生成 recall / balanced / precision_pilot 检索式。
 - `search_agent`：调用 OpenAlex、Crossref、Europe PMC、PubMed、Semantic Scholar、CORE、arXiv、WoS、Scopus，穷尽分页并保存原始响应。
 - `dedup_agent`：按 DOI 优先、规范化题名+年份次之去重，冲突不自动吞并。

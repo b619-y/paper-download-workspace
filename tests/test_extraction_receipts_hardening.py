@@ -150,3 +150,17 @@ def test_zero_width_locator_is_not_visible_evidence() -> None:
     response["records"][0]["fields"][0]["evidence"][0]["locator"] = "\u200b"
     with pytest.raises(ValueError, match="evidence"):
         luna_extract_data.validate_response(response)
+
+
+def test_receipt_merge_rejects_a_symlinked_task_results_root(tmp_path: Path) -> None:
+    task_id, _ = setup_task(tmp_path)
+    paths = task_paths(tmp_path, task_id)
+    outside = tmp_path.parent / f"{tmp_path.name}-external-results"
+    receipt = outside / "data_extraction/job/receipts/attempt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}", encoding="utf-8")
+    paths["results"].parent.mkdir(parents=True, exist_ok=True)
+    paths["results"].symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not contain symlinks"):
+        merge_extraction_receipts.merge_one(paths, receipt)

@@ -5,6 +5,8 @@ developer_instructions = """
 
 先报告：当前阶段、已完成证据、未完成项、阻塞、下一个最小安全动作。然后只继续该动作，不跳步，不重做已完成阶段。当多个任务或批次并存时，必须指明 task_id/batch_id；无法唯一确定时停止写入并请用户选择。
 
+如果 stage 含 INVALID、BLOCKED、FAILED、ERROR、INCOMPLETE 或 RECOVERY，先委派唯一的 recovery_agent：运行 `python3 scripts/workflow_recovery.py status --root . --task-id <task_id>`；只有它列出 safe_actions 时才运行 `python3 scripts/workflow_recovery.py run --root . --task-id <task_id> --policy safe --max-actions 3`。它的自动白名单只有“已验证权威 SQLite/JSON 队列 → CSV 投影”重建；中断验收、过期 lease 和 receipt 合并交回原 coordinator/worker/人工流程。恢复后重跑 workflow_status。没有白名单动作、修复无效或仍异常时停止并报告，不自行扩大权限或重试预算。
+
 路由规则：
 1. 没有任务简报：先收集研究目标、纳入/排除标准、目标数据/方法、时间和语言范围、已知相关论文，并明确 `requires_fulltext_screening`、`requires_document_processing` 和 `requires_data_extraction`。全文筛选不自动强制文档处理；只有用户需要解析/模型检索时才设 `requires_document_processing=true`。数据提取必须把三个标志都设为 true。信息足够时按合同创建 `runtime/tasks/<task_id>/task_brief.json` 和 `runtime/ACTIVE_TASK.json`，然后重跑状态检查。信息不足不启动 API 检索。
 2. -1 阶段：调用 query_agent/literature-query-agent，产生并实测 recall、balanced、precision_pilot。
