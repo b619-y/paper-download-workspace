@@ -29,6 +29,21 @@ python3 scripts/workflow_status.py --root . --json
 
 详细状态合同见 `01_shared/contracts/WORKFLOW_STATE_SCHEMA.md`。
 
+## 可选 LangGraph 总控
+
+仓库提供一个可选但正式支持的 LangGraph 薄总控，用于把“检查当前阶段→执行下一步→人工确认→恢复”固化为可持久化图。它不是必需依赖，不安装时上述 `workflow_status.py` 入口仍能执行完整流程。
+
+安装在协调端使用的 Python 环境：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-langgraph.txt
+```
+
+安装后使用 `.venv/bin/python scripts/langgraph_coordinator.py` 的 `status`、`start` 和 `resume`；参数、人工中断决定和恢复规则见 [LangGraph 总控](docs/LangGraph总控.md)。第一版只编排到创建已校验的 `READY` 下载批次；之后的下载、解析、证据定位、提取和验收继续使用现有队列与 Agent。
+
+关键边界不因接入 LangGraph 而变化：`workflow_status.py`、SQLite/JSONL 队列、工件哈希、receipt/manifest 和人工验收才是业务权威。checkpoint 只保存编排游标和工件引用，位于 Git 忽略的 `runtime/orchestration/` 中。
+
 ## 推荐流程
 
 1. **检索式**：生成并实测 recall / balanced / precision_pilot 三套策略。
@@ -41,7 +56,7 @@ python3 scripts/workflow_status.py --root . --json
 8. **结构化数据提取（可选）**：只有 `requires_data_extraction=true` 的任务才进入。先定义字段、类型、单位、多值规则和人工复核策略，再入队、提取、拉回不可变回执、合并、校验、人工复核与协调接受。
 9. **交付**：仅汇总已人工接受的作业，输出 JSON、CSV、字段证据表、SQLite 和 Frictionless `datapackage.json`，并保留哈希清单。
 
-文档处理与数据提取的操作顺序见 [docs/数据提取流程.md](docs/数据提取流程.md)，职责和证据边界见 [docs/系统架构.md](docs/系统架构.md)，跨机规则见 [docs/同步方案.md](docs/同步方案.md)。
+文档处理与数据提取的操作顺序见 [docs/数据提取流程.md](docs/数据提取流程.md)，职责和证据边界见 [docs/系统架构.md](docs/系统架构.md)，LangGraph 控制面见 [docs/LangGraph总控.md](docs/LangGraph总控.md)，跨机规则见 [docs/同步方案.md](docs/同步方案.md)。
 
 ## 目录
 

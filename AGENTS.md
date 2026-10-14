@@ -20,6 +20,18 @@ python3 scripts/workflow_status.py --root . --json
 
 协调端是 `runtime/ACTIVE_TASK.json`、`runtime/tasks/`、下载批次验收和论文索引的权威端。计算 Agent 开始前应由协调端运行任务限定的同步模式；远端目标来自 `PAPER_SYNC_REMOTE_HOST` / `PAPER_SYNC_REMOTE_ROOT`，processing 与全文传输分别要求对应的 `allow-remote-worker` 政策。计算端可为租约修改自己的任务队列副本，但只有 `runtime/results/` 中经绑定的候选结果和 `receipts/<attempt_id>.json` 不可变回执能拉回；协调端必须运行 `scripts/merge_extraction_receipts.py --root . --task-id <task_id> --actor-role coordinator`、validator 和人工验收后才合并状态。任何 PDF/XML、解析全文、PaperQA 索引、提取候选和审核队列都是运行数据，不得进入 Git。原文上传外部服务默认禁止；只有工作区政策和本次任务明确允许时，才能使用带显式授权开关的外部 MinerU 上传路径。
 
+## 可选但正式的 LangGraph 薄总控
+
+LangGraph 只是一层可恢复的编排控制面，不替代上述强制入口和业务合同。未安装可选依赖时，直接运行 `workflow_status.py` 的原流程仍是完整受支持的基线。安装后只通过 `scripts/langgraph_coordinator.py` 的 `status` / `start` / `resume` 子命令使用，操作前先读 `docs/LangGraph总控.md`。
+
+- `workflow_status.py`、SQLite/JSONL 权威队列、工件 SHA-256、不可变 receipt/manifest 和人工验收记录仍是业务真相。
+- LangGraph checkpoint 只保存 task/thread 标识、编排游标、工作区相对路径、摘要和人工中断回复；不存 PDF/XML、解析全文、API 凭据或一套并行的业务状态。
+- 第一版范围仅到产生已校验的 `READY` 下载批次。下载、MinerU/XML、PaperQA/Luna、数据提取和验收继续由现有队列和 Agent 处理。
+- 多数据库并行检索必须“每个来源独立目录/状态→单一确定性 reducer”；不得让并行分支共写总 manifest 或靠 LLM 自由合并。
+- 检索式确认、筛选结果交接等人工决定使用 interrupt；恢复后节点可能重放，所有副作用必须依赖现有 ID、hash、receipt 和验收闸门保证幂等。
+- 普通 `StateGraph` 不会自动跨主机调度。Mac/capg/capg2 之间仍使用已有队列、授权同步和不可变回执；checkpoint 不得双向同步或由 Worker 改写。
+- checkpoint 与其 SQLite/WAL/锁文件属于 `runtime/` 运行数据，不得提交 Git。
+
 ## 总原则
 
 - 先读 `README_总控.md`、`00_control/POLICIES.md` 和相关合同。
@@ -39,6 +51,7 @@ python3 scripts/workflow_status.py --root . --json
 ## 智能体入口
 
 - `workflow_coordinator_agent`：先读取真实文件状态，判断断点并只调度下一阶段。
+- `langgraph_coordinator_agent`：可选的持久化薄总控，用于检索式→多源检索→题名/摘要筛选→`READY` 批次的中断恢复和并行编排；不是新的业务状态源。
 - `query_agent`：拆解问题，生成 recall / balanced / precision_pilot 检索式。
 - `search_agent`：调用 OpenAlex、Crossref、Europe PMC、PubMed、Semantic Scholar、CORE、arXiv、WoS、Scopus，穷尽分页并保存原始响应。
 - `dedup_agent`：按 DOI 优先、规范化题名+年份次之去重，冲突不自动吞并。

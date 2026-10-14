@@ -398,7 +398,10 @@ def run_pubmed(client: HttpClient, query: str, original: str, raw_dir: Path,
     if os.environ.get("NCBI_EMAIL") or client.mailto:
         params["email"] = os.environ.get("NCBI_EMAIL") or client.mailto
     search = client.json("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi", params=params)
-    save_json(raw_dir, 0, search)
+    # ESearch is itself an auditable raw response page.  Counting it keeps a
+    # legitimate zero-hit search compatible with the workflow invariant that a
+    # completed source has at least one raw page.
+    save_json(raw_dir, 1, search)
     info = search.get("esearchresult") or {}
     total = int(info.get("count") or 0)
     webenv = info.get("webenv")
@@ -406,7 +409,7 @@ def run_pubmed(client: HttpClient, query: str, original: str, raw_dir: Path,
     if total and (not webenv or not query_key):
         raise SearchFailure("PubMed ESearch did not return WebEnv/query_key")
     records: list[dict[str, str]] = []
-    page = 0
+    page = 1
     batch = 500
     target = min(total, max_records) if max_records > 0 else total
     for start in range(0, target, batch):

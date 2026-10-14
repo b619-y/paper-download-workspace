@@ -1,0 +1,4 @@
+# Optional LangGraph control plane.  The core workspace does not require these
+# packages; install them only on the coordinator that runs the graph CLI.
+langgraph>=1.2.0,<2.0.0
+langgraph-checkpoint-sqlite>=3.1.0,<4.0.0

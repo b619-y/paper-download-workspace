@@ -18,6 +18,36 @@ python3 scripts/init_download_workspace.py --root .
 python3 scripts/workflow_status.py --root . --json
 ```
 
+上述初始化与 `workflow_status.py` 检查始终是强制入口。工作区另提供可选的
+LangGraph 薄总控，只用于持久化“当前在哪一步、正在等哪个人工决定、恢复后调用哪个已有脚本”。
+它不替代权威状态、队列、哈希、manifest/receipt 或人工验收。未安装可选依赖时，
+基线流程完全可用，不得改用内存 checkpoint 伪装可恢复。
+
+需要持久化总控时，先阅读 `docs/LangGraph总控.md`，再使用：
+
+```bash
+# 只读权威状态，不需 LangGraph 依赖
+.venv/bin/python scripts/langgraph_coordinator.py status --root . --task-id <task_id>
+
+# 首次启动一个持久化 thread，运行到下一个 interrupt 或终态
+.venv/bin/python scripts/langgraph_coordinator.py start --root . --task-id <task_id>
+
+# 只能选用当次 interrupt.allowed_actions 列出的决定
+.venv/bin/python scripts/langgraph_coordinator.py resume \
+  --root . --task-id <task_id> \
+  --decision <allowed-action> --interrupt-id <current-interrupt-id>
+```
+
+`start` / `resume` 前后都会重读 `workflow_status.py`；不得凭聊天记忆推断
+`approve` / `completed` / `retry`。第一版只编排“检索式→多源 API 检索→确定性去重→
+题名/摘要筛选→已校验 `READY` 下载批次”；下载、MinerU/XML、PaperQA/Luna、
+全文复筛和数据提取仍由原队列与 Agent 继续。checkpoint 必须位于工作区
+`runtime/orchestration/` 下，不可同步进 Git，也不可在 Mac/capg/capg2 间双向合并。
+如果丢失上次 interrupt 输出，先运行不带决定的 `resume` 只读重显当前 ID；
+不得沿用旧 ID 提交决定。
+若 `.venv/bin/python` 不存在，先按 `docs/LangGraph总控.md` 安装可选依赖；不要改用
+内存 checkpointer。仅运行基线状态检查时仍可直接使用 `python3 scripts/workflow_status.py`。
+
 初始化命令可重复运行：公开 clone 中只有索引/决策示例，它会在本机创建被 Git 忽略的
 真实 `BATCH_INDEX.csv`、`PAPER_INDEX.csv`、`DECISIONS.md`，并安全追加兼容旧表头
 缺少的列；不会把真实运行数据变成仓库模板。
