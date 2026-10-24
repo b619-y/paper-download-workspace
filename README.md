@@ -54,6 +54,7 @@ python3 scripts/workflow_status.py --root . --json
 ## 文档导航
 
 - [系统架构](docs/系统架构.md)
+- [团队体系：角色分工与交接](docs/团队体系.md)
 - [下载后文档处理与数据提取](docs/数据提取流程.md)
 - [LangGraph 薄总控](docs/LangGraph总控.md)
 - [故障恢复智能体](docs/故障恢复智能体.md)
